@@ -103,16 +103,52 @@ fn execute_hvm(args: &[&OsStr], send_io: bool) -> Result<String, Box<dyn Error>>
   stderr.read_to_string(&mut output)?;
 
   Ok(if !status.success() {
-    format!("{status}\n{output}")
+    normalize_error_output(&format!("{status}\n{output}"))
   } else {
     parse_output(&output).unwrap_or_else(|err| panic!("error parsing output:\n{err}\n\n{output}"))
   })
 }
 
+/// Nightly rustc / Windows: `exit code` vs `exit status`, `thread 'main' (pid)`, `src\`.
+fn normalize_error_output(text: &str) -> String {
+  let text = text.replace("\r\n", "\n").replace('\r', "\n");
+  let text = text.replace("exit code:", "exit status:");
+  let text = strip_thread_pid(&text).replace('\\', "/");
+  text.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
+fn strip_thread_pid(text: &str) -> String {
+  let mut out = String::with_capacity(text.len());
+  let mut rest = text;
+  while let Some(idx) = rest.find("thread '") {
+    out.push_str(&rest[..idx]);
+    let after_kw = &rest[idx + "thread '".len()..];
+    if let Some(name_end) = after_kw.find('\'') {
+      out.push_str("thread '");
+      out.push_str(&after_kw[..=name_end]);
+      let after_name = &after_kw[name_end + 1..];
+      if let Some(inner) = after_name.strip_prefix(" (") {
+        if let Some(close) = inner.find(')') {
+          if !inner[..close].is_empty() && inner[..close].bytes().all(|b| b.is_ascii_digit()) {
+            rest = &inner[close + 1..];
+            continue;
+          }
+        }
+      }
+      rest = after_name;
+    } else {
+      out.push_str("thread '");
+      rest = after_kw;
+    }
+  }
+  out.push_str(rest);
+  out
+}
+
 fn parse_output(output: &str) -> Result<String, String> {
   let mut lines = Vec::new();
 
-  for line in output.lines() {
+  for line in output.replace('\r', "").lines() {
     if line.starts_with("Result:") {
       let mut parser = hvm::ast::CoreParser::new(line);
       parser.consume("Result:")?;
