@@ -77,7 +77,7 @@ static inline int hvm_dlclose(void *handle) {
   return FreeLibrary((HMODULE)handle) ? 0 : -1;
 }
 
-static inline const char *hvm_dlerror(void) {
+static inline char *hvm_dlerror(void) {
   return hvm_dlerr[0] ? hvm_dlerr : NULL;
 }
 
@@ -111,8 +111,10 @@ static inline void hvm_setlinebuf(FILE *f) {
 
 // Use POSIX newlines on pipes so Bend / other tools can split on '\n'.
 static inline void hvm_stdio_setup(void) {
+#if defined(_MSC_VER) || defined(__MINGW32__)
   _setmode(_fileno(stdout), _O_BINARY);
   _setmode(_fileno(stderr), _O_BINARY);
+#endif
   hvm_setlinebuf(stdout);
   hvm_setlinebuf(stderr);
 }

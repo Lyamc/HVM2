@@ -1,0 +1,15 @@
+# Target-specific link flags for smaller, faster --release binaries.
+# These apply on top of [profile.release] in Cargo.toml (LTO, strip, CGU=1).
+# Project values override a user-level `linker = "lld-link"` that breaks the VS CRT.
+
+[target.x86_64-pc-windows-msvc]
+linker = "link.exe"
+rustflags = ["-C", "link-arg=/OPT:REF", "-C", "link-arg=/OPT:ICF"]
+
+[target.x86_64-pc-windows-gnu]
+linker = "gcc"
+rustflags = ["-C", "link-arg=-Wl,--gc-sections"]
+
+[target.x86_64-pc-windows-gnullvm]
+linker = "clang"
+rustflags = ["-C", "link-arg=-Wl,--gc-sections"]

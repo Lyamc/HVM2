@@ -22,9 +22,16 @@ num_cpus = "1.0"
 cc = "1.0"
 num_cpus = "1.0"
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
 [features]
 default = []
-# C and CUDA features are determined during build
+# Enabled automatically by build.rs when the matching compiler is found.
+# Set HVM_SKIP_C / HVM_SKIP_CUDA to force the Rust-only build.
 c = []
 cuda = []
 

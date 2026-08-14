@@ -3,23 +3,27 @@ on:
   push:
   pull_request:
 jobs:
-  build:
+  msvc:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build (MSVC link.exe)
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build (MSVC)
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
             call "%%i\VC\Auxiliary\Build\vcvars64.bat"
           )
           set RUSTFLAGS=-C linker=link.exe
-          cargo build --release
-      - name: Rust interpreter smoke
+          cargo build --release --target x86_64-pc-windows-msvc
+      - name: Rust + C smoke
         shell: cmd
         run: |
-          target\release\hvm.exe run tests\programs\hello-world.hvm
+          target\x86_64-pc-windows-msvc\release\hvm.exe run tests\programs\hello-world.hvm
+          target\x86_64-pc-windows-msvc\release\hvm.exe run-c tests\programs\hello-world.hvm
       - name: Test
         shell: cmd
         run: |
@@ -27,4 +31,30 @@ jobs:
             call "%%i\VC\Auxiliary\Build\vcvars64.bat"
           )
           set RUSTFLAGS=-C linker=link.exe
-          cargo test --release -- --skip test_run_examples
+          cargo test --release --target x86_64-pc-windows-msvc -- --skip test_run_examples
+
+  gnu:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+          path-type: inherit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Build (GNU)
+        env:
+          CC: gcc
+        run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: Rust + C smoke
+        run: |
+          target/x86_64-pc-windows-gnu/release/hvm.exe run tests/programs/hello-world.hvm
+          target/x86_64-pc-windows-gnu/release/hvm.exe run-c tests/programs/hello-world.hvm
