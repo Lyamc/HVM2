@@ -1,12 +1,22 @@
 #include <inttypes.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdatomic.h>
+#include "hvm_os.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+#ifdef VOID
+#undef VOID
+#endif
 
 #ifdef DEBUG
   #define debug(...) fprintf(stderr, __VA_ARGS__)
@@ -122,12 +132,15 @@ static const f32 I24_MIN = (f32) (i32) ((-1u) << 23);
 #define RLEN (1ul << 24) // max 16m low-priority redexes
 #define G_NODE_LEN (1ul << 29) // max 536m nodes
 #define G_VARS_LEN (1ul << 29) // max 536m vars
-#define G_RBAG_LEN (TPC * RLEN)
+// size_t: MSVC unsigned long is 32-bit and TPC*RLEN can exceed 2^32-1.
+#define G_RBAG_LEN ((size_t)TPC * (size_t)RLEN)
 
+// Buffers are heap pointers so the type stays under MSVC's 2 GiB object limit
+// (inline G_NODE_LEN/G_VARS_LEN arrays are 4 GiB + 2 GiB).
 typedef struct Net {
-  APair node_buf[G_NODE_LEN]; // global node buffer
-  APort vars_buf[G_VARS_LEN]; // global vars buffer
-  APair rbag_buf[G_RBAG_LEN]; // global rbag buffer
+  APair *node_buf; // global node buffer
+  APort *vars_buf; // global vars buffer
+  APair *rbag_buf; // global rbag buffer
   a64 itrs; // interaction count
   a32 idle; // idle thread counter
 } Net;
@@ -258,13 +271,13 @@ static inline void swap(Port *a, Port *b) {
   Port x = *a; *a = *b; *b = x;
 }
 
-static inline u32 min(u32 a, u32 b) {
+static inline u32 hvm_min(u32 a, u32 b) {
   return (a < b) ? a : b;
 }
 
-static inline f32 clamp(f32 x, f32 min, f32 max) {
-  const f32 t = x < min ? min : x;
-  return (t > max) ? max : t;
+static inline f32 clamp(f32 x, f32 lo, f32 hi) {
+  const f32 t = x < lo ? lo : x;
+  return (t > hi) ? hi : t;
 }
 
 // A simple spin-wait barrier using atomic operations
@@ -279,7 +292,7 @@ void sync_threads() {
   } else {
     u32 tries = 0;
     while (atomic_load_explicit(&a_barrier, memory_order_acquire) == barrier_old) {
-      sched_yield();
+      hvm_yield();
     }
   }
 }
@@ -295,11 +308,8 @@ u32 global_sum(u32 x) {
   return sum;
 }
 
-// TODO: write a time64() function that returns the time as fast as possible as a u64
 static inline u64 time64() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+  return (u64)hvm_time_ns();
 }
 
 // Ports / Pairs / Rules
@@ -697,9 +707,35 @@ static inline Port vars_take(Net* net, u32 var) {
 // Net
 // ---
 
-// Initializes a net.
+static inline void net_free(Net* net) {
+  if (!net) return;
+  free((void*)net->node_buf);
+  free((void*)net->vars_buf);
+  free((void*)net->rbag_buf);
+  free(net);
+}
+
+// Initializes a net. Buffers are allocated separately so sizeof(Net) stays small.
 static inline Net* net_new() {
-  Net* net = calloc(1, sizeof(Net));
+  Net* net = (Net*)calloc(1, sizeof(Net));
+  if (!net) {
+    fprintf(stderr, "HVM: out of memory allocating Net\n");
+    exit(1);
+  }
+  net->node_buf = (APair*)calloc(G_NODE_LEN, sizeof(APair));
+  net->vars_buf = (APort*)calloc(G_VARS_LEN, sizeof(APort));
+  net->rbag_buf = (APair*)calloc(G_RBAG_LEN, sizeof(APair));
+  if (!net->node_buf || !net->vars_buf || !net->rbag_buf) {
+    fprintf(stderr,
+      "HVM: out of memory allocating net buffers "
+      "(nodes=%zu vars=%zu rbag=%zu bytes). "
+      "The C runtime needs several gigabytes of RAM.\n",
+      (size_t)G_NODE_LEN * sizeof(APair),
+      (size_t)G_VARS_LEN * sizeof(APort),
+      (size_t)G_RBAG_LEN * sizeof(APair));
+    net_free(net);
+    exit(1);
+  }
 
   atomic_store(&net->itrs, 0);
   atomic_store(&net->idle, 0);
@@ -770,7 +806,7 @@ u32 vars_alloc(Net* net, TM* tm, u32 num) {
 
 // Gets the necessary resources for an interaction. Returns success.
 static inline bool get_resources(Net* net, TM* tm, u32 need_rbag, u32 need_node, u32 need_vars) {
-  u32 got_rbag = min(RLEN - tm->rput, HLEN - tm->hput);
+  u32 got_rbag = hvm_min(RLEN - tm->rput, HLEN - tm->hput);
   u32 got_node = node_alloc(net, tm, need_node);
   u32 got_vars = vars_alloc(net, tm, need_vars);
 
@@ -1168,7 +1204,7 @@ void evaluator(Net* net, TM* tm, Book* book) {
       }
 
       // Chill...
-      sched_yield();
+      hvm_yield();
       // Halt if all threads are idle
       if (tick % 256 == 0) {
         if (atomic_load_explicit(&net->idle, memory_order_relaxed) == TPC) {
@@ -1194,11 +1230,19 @@ typedef struct {
   Book* book;
 } ThreadArg;
 
+#ifdef _WIN32
+DWORD WINAPI thread_func(LPVOID arg) {
+  ThreadArg* data = (ThreadArg*)arg;
+  evaluator(data->net, data->tm, data->book);
+  return 0;
+}
+#else
 void* thread_func(void* arg) {
   ThreadArg* data = (ThreadArg*)arg;
   evaluator(data->net, data->tm, data->book);
   return NULL;
 }
+#endif
 
 // Sets the initial redex.
 void boot_redex(Net* net, Pair redex) {
@@ -1218,14 +1262,14 @@ void normalize(Net* net, Book* book) {
   }
 
   // Spawns the evaluation threads
-  pthread_t threads[TPC];
+  hvm_thread_t threads[TPC];
   for (u32 t = 0; t < TPC; ++t) {
-    pthread_create(&threads[t], NULL, thread_func, &thread_arg[t]);
+    hvm_thread_spawn(&threads[t], thread_func, &thread_arg[t]);
   }
 
   // Wait for the threads to finish
   for (u32 t = 0; t < TPC; ++t) {
-    pthread_join(threads[t], NULL);
+    hvm_thread_join(threads[t]);
   }
 }
 
@@ -1741,6 +1785,8 @@ void do_run_io(Net* net, Book* book, Port port);
 // ----
 
 void hvm_c(u32* book_buffer) {
+  hvm_stdio_setup();
+
   // Creates static TMs
   alloc_static_tms();
 
@@ -1786,7 +1832,7 @@ void hvm_c(u32* book_buffer) {
 
   // Frees everything
   free_static_tms();
-  free(net);
+  net_free(net);
   free(book);
 }
 

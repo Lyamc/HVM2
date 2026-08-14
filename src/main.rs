@@ -114,7 +114,7 @@ fn main() {
       let bookb = format!("static const u8 BOOK_BUF[] = {};", bookb);
 
       // Generates the C file
-      let hvm_c = include_str!("hvm.c");
+      let hvm_c = include_str!("hvm.c").replace("#include \"hvm_os.h\"", include_str!("hvm_os.h"));
       let hvm_c = format!("#define IO\n\n{hvm_c}");
       let hvm_c = hvm_c.replace("///COMPILED_INTERACT_CALL///", &cmp::compile_book(cmp::Target::C, &book));
       let hvm_c = hvm_c.replace("#define INTERPRETED", "#define COMPILED");

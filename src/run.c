@@ -1,7 +1,9 @@
-#include <dlfcn.h>
 #include <errno.h>
 #include <stdio.h>
 #include "hvm.c"
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 // Readback: λ-Encoded Ctr
 typedef struct Ctr {
@@ -630,11 +632,7 @@ Port io_sleep(Net* net, Book* book, Port argm) {
   u32 dur_lo = get_u24(get_val(tup.elem_buf[1]));
   // Combine into a 48-bit duration in nanoseconds
   u64 dur_ns = (((u64)dur_hi) << 24) | dur_lo;
-  // Sleep for the specified duration
-  struct timespec ts;
-  ts.tv_sec = dur_ns / 1000000000;
-  ts.tv_nsec = dur_ns % 1000000000;
-  nanosleep(&ts, NULL);
+  hvm_sleep_ns(dur_ns);
 
   return inject_ok(net, new_port(ERA, 0));
 }
@@ -740,8 +738,7 @@ void book_init(Book* book) {
 void do_run_io(Net* net, Book* book, Port port) {
   book_init(book);
 
-  setlinebuf(stdout);
-  setlinebuf(stderr);
+  hvm_stdio_setup();
 
   // IO loop
   while (true) {
