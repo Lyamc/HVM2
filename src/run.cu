@@ -1,6 +1,10 @@
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
+#include "hvm_os.h"
 #include "hvm.cu"
 
 // Readback: λ-Encoded Ctr
@@ -437,29 +441,25 @@ extern "C" Port gnet_inject_io_err(GNet* gnet, IOError err) {
 
 /// Returns a λ-Encoded Ctr for a Result/Err(IOError/Type)
 extern "C" Port gnet_inject_io_err_type(GNet* gnet) {
-  IOError io_error = {
-    .tag = IO_ERR_TYPE,
-  };
-
+  IOError io_error;
+  io_error.tag = IO_ERR_TYPE;
+  io_error.val = 0;
   return gnet_inject_io_err(gnet, io_error);
 }
 
 /// Returns a λ-Encoded Ctr for a Result/Err(IOError/Name)
 extern "C" Port gnet_inject_io_err_name(GNet* gnet) {
-  IOError io_error = {
-    .tag = IO_ERR_NAME,
-  };
-
+  IOError io_error;
+  io_error.tag = IO_ERR_NAME;
+  io_error.val = 0;
   return gnet_inject_io_err(gnet, io_error);
 }
 
 /// Returns a λ-Encoded Ctr for a Result/Err(IOError/Inner(val))
 extern "C" Port gnet_inject_io_err_inner(GNet* gnet, Port val) {
-  IOError io_error = {
-    .tag = IO_ERR_INNER,
-    .val = val,
-  };
-
+  IOError io_error;
+  io_error.tag = IO_ERR_INNER;
+  io_error.val = val;
   return gnet_inject_io_err(gnet, io_error);
 }
 
@@ -745,10 +745,7 @@ Port io_sleep(GNet* gnet, Port argm) {
   // Combine into a 48-bit duration in nanoseconds
   u64 dur_ns = (((u64)dur_hi) << 24) | dur_lo;
   // Sleep for the specified duration
-  struct timespec ts;
-  ts.tv_sec = dur_ns / 1000000000;
-  ts.tv_nsec = dur_ns % 1000000000;
-  nanosleep(&ts, NULL);
+  hvm_sleep_ns(dur_ns);
 
   return gnet_inject_ok(gnet, new_port(ERA, 0));
 }
@@ -834,18 +831,25 @@ Port io_dl_close(GNet* gnet, Book* book, Port argm) {
   return gnet_inject_ok(gnet, new_port(ERA, 0));
 }
 
+static void book_push_ffn(Book* book, const char* name, Port (*func)(GNet*, Port)) {
+  FFn* f = &book->ffns_buf[book->ffns_len++];
+  memset(f->name, 0, sizeof(f->name));
+  strncpy(f->name, name, sizeof(f->name) - 1);
+  f->func = func;
+}
+
 void book_init(Book* book) {
-  book->ffns_buf[book->ffns_len++] = (FFn){"READ", io_read};
-  book->ffns_buf[book->ffns_len++] = (FFn){"OPEN", io_open};
-  book->ffns_buf[book->ffns_len++] = (FFn){"CLOSE", io_close};
-  book->ffns_buf[book->ffns_len++] = (FFn){"FLUSH", io_flush};
-  book->ffns_buf[book->ffns_len++] = (FFn){"WRITE", io_write};
-  book->ffns_buf[book->ffns_len++] = (FFn){"SEEK", io_seek};
-  book->ffns_buf[book->ffns_len++] = (FFn){"GET_TIME", io_get_time};
-  book->ffns_buf[book->ffns_len++] = (FFn){"SLEEP", io_sleep};
-  book->ffns_buf[book->ffns_len++] = (FFn){"DL_OPEN", io_dl_open};
-  book->ffns_buf[book->ffns_len++] = (FFn){"DL_CALL", io_dl_call};
-  book->ffns_buf[book->ffns_len++] = (FFn){"DL_CLOSE", io_dl_open};
+  book_push_ffn(book, "READ", io_read);
+  book_push_ffn(book, "OPEN", io_open);
+  book_push_ffn(book, "CLOSE", io_close);
+  book_push_ffn(book, "FLUSH", io_flush);
+  book_push_ffn(book, "WRITE", io_write);
+  book_push_ffn(book, "SEEK", io_seek);
+  book_push_ffn(book, "GET_TIME", io_get_time);
+  book_push_ffn(book, "SLEEP", io_sleep);
+  book_push_ffn(book, "DL_OPEN", io_dl_open);
+  book_push_ffn(book, "DL_CALL", io_dl_call);
+  book_push_ffn(book, "DL_CLOSE", io_dl_open);
 
   cudaMemcpyToSymbol(BOOK, book, sizeof(Book));
 }
@@ -857,8 +861,7 @@ void book_init(Book* book) {
 void do_run_io(GNet* gnet, Book* book, Port port) {
   book_init(book);
 
-  setlinebuf(stdout);
-  setlinebuf(stderr);
+  hvm_stdio_setup();
 
   // IO loop
   while (true) {

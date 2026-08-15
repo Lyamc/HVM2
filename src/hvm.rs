@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::alloc::{alloc, dealloc, Layout};
 use std::mem;
 
@@ -528,6 +529,10 @@ impl<'a> GNet<'a> {
 
 }
 
+// All GNet accesses go through atomics (or happen before threads start).
+unsafe impl Sync for GNet<'_> {}
+unsafe impl Send for GNet<'_> {}
+
 impl<'a> Drop for GNet<'a> {
   fn drop(&mut self) {
     let nlay = Layout::array::<APair>(self.nlen).unwrap();
@@ -556,29 +561,49 @@ impl TMem {
     }
   }
 
+  fn alloc_range(&self, len: usize) -> (usize, usize) {
+    if self.tids <= 1 {
+      return (0, len);
+    }
+    let span = len / self.tids as usize;
+    let base = self.tid as usize * span;
+    let end = if self.tid + 1 == self.tids { len } else { base + span };
+    (base, end)
+  }
+
   pub fn node_alloc(&mut self, net: &GNet, num: usize) -> usize {
     let mut got = 0;
     for _ in 0..net.nlen {
       self.nput += 1; // index 0 reserved
+      if self.tids > 1 {
+        let (base, end) = self.alloc_range(net.nlen);
+        if self.nput >= end || self.nput == 0 {
+          self.nput = base.max(1);
+        }
+      }
       if self.nput < net.nlen-1 || net.is_node_free(self.nput % net.nlen) {
         self.nloc[got] = self.nput % net.nlen;
         got += 1;
-        //println!("ALLOC NODE {} {}", got, self.nput);
       }
       if got >= num {
         break;
       }
     }
-    return got
+    got
   }
 
   pub fn vars_alloc(&mut self, net: &GNet, num: usize) -> usize {
     let mut got = 0;
     for _ in 0..net.vlen {
       self.vput += 1; // index 0 reserved for FREE
-      if self.vput < net.vlen-1 || net.is_vars_free(self.vput % net.vlen) {
+      if self.tids > 1 {
+        let (base, end) = self.alloc_range(net.vlen);
+        if self.vput >= end || self.vput == 0 {
+          self.vput = base.max(1);
+        }
+      }
+      if self.vput < net.vlen-1 || net.is_vars_free(self.vput % net.nlen) {
         self.vloc[got] = self.vput % net.nlen;
-        //println!("ALLOC VARS {} {}", got, self.vput);
         got += 1;
       }
       if got >= num {
@@ -948,6 +973,72 @@ impl TMem {
 
     net.itrs.fetch_add(self.itrs as u64, Ordering::Relaxed);
     self.itrs = 0;
+  }
+
+  /// Multi-thread evaluator with a shared steal bag per worker.
+  pub fn evaluator_pool(net: &GNet, book: &Book, boot: Pair, nthreads: u32) {
+    let n = nthreads.max(1) as usize;
+    let idle = AtomicU32::new(n as u32);
+    let bags: Vec<Mutex<Vec<Pair>>> = (0..n).map(|_| Mutex::new(Vec::new())).collect();
+    bags[0].lock().unwrap().push(boot);
+
+    std::thread::scope(|scope| {
+      for tid in 0..n {
+        let bags = &bags;
+        let idle = &idle;
+        scope.spawn(move || {
+          let mut tm = TMem::new(tid as u32, n as u32);
+          let (nbase, _) = tm.alloc_range(net.nlen);
+          let (vbase, _) = tm.alloc_range(net.vlen);
+          tm.nput = nbase;
+          tm.vput = vbase;
+
+          let mut busy = false;
+          let mut tick = 0u32;
+          loop {
+            tick = tick.wrapping_add(1);
+            if tm.rbag.len() == 0 {
+              for k in 0..n {
+                let j = (tid + k) % n;
+                if let Ok(mut g) = bags[j].try_lock() {
+                  if let Some(r) = g.pop() {
+                    tm.rbag.push_redex(r);
+                    break;
+                  }
+                }
+              }
+            }
+
+            if tm.rbag.len() > 0 {
+              if !busy {
+                idle.fetch_sub(1, Ordering::Relaxed);
+                busy = true;
+              }
+              tm.interact(net, book);
+              if tm.rbag.lo.len() > 64 {
+                if let Ok(mut g) = bags[tid].try_lock() {
+                  let take = tm.rbag.lo.len() / 2;
+                  g.extend(tm.rbag.lo.drain(..take));
+                }
+              }
+            } else {
+              if busy {
+                idle.fetch_add(1, Ordering::Relaxed);
+                busy = false;
+              }
+              if tick % 64 == 0 && idle.load(Ordering::Relaxed) == n as u32 {
+                let empty = bags.iter().all(|b| b.lock().map(|g| g.is_empty()).unwrap_or(false));
+                if empty {
+                  break;
+                }
+              }
+              std::thread::yield_now();
+            }
+          }
+          net.itrs.fetch_add(tm.itrs as u64, Ordering::Relaxed);
+        });
+      }
+    });
   }
 }
 

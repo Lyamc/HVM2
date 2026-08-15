@@ -42,7 +42,7 @@ fn test_file(path: &Path) {
   }
 
   println!("testing {path:?}...");
-  let rust_output = execute_hvm(&["run".as_ref(), path.as_os_str()], false).unwrap();
+  let rust_output = execute_hvm(&["run".as_ref(), "--threads".as_ref(), "1".as_ref(), path.as_os_str()], false).unwrap();
   assert_snapshot!(rust_output);
 
   if contents.contains("@test-rust-only = 1") {
@@ -51,7 +51,7 @@ fn test_file(path: &Path) {
   }
 
   println!("  testing {path:?}, C...");
-  let c_output = execute_hvm(&["run-c".as_ref(), path.as_os_str()], false).unwrap();
+  let c_output = execute_hvm(&["run-c".as_ref(), "--threads".as_ref(), "1".as_ref(), path.as_os_str()], false).unwrap();
   assert_eq!(c_output, rust_output, "{path:?}: C output does not match rust output");
 
   if cfg!(feature = "cuda") {

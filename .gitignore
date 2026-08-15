@@ -5,6 +5,7 @@ src/old_cmp.rs
 src/tmp/
 target/
 tmp/
+tmp_nvcc/
 .hvm/
 examples/**/main
 examples/**/*.c

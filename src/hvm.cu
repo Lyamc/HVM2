@@ -10,6 +10,27 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef VOID
+#undef VOID
+#endif
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+#else
+#include <time.h>
+#endif
 
 // Integers
 // --------
@@ -126,9 +147,10 @@ struct RBag {
   Pair lo_buf[RLEN];
 };
 
-// Local Net
-const u32 L_NODE_LEN = 0x2000;
-const u32 L_VARS_LEN = 0x2000;
+// Local Net: 0x1C00 → 56 slots/thread (radix is 53 nodes). sizeof(LNet)=86 KiB
+// plus 1 KiB spawn stays under sm_86's 99 KiB/block cap.
+const u32 L_NODE_LEN = 0x1C00;
+const u32 L_VARS_LEN = 0x1C00;
 struct LNet {
   Pair node_buf[L_NODE_LEN];
   Port vars_buf[L_VARS_LEN];
@@ -141,10 +163,11 @@ const u32 G_RBAG_LEN = TPB * BPG * RLEN * 3; // max 4m redexes
 struct GNet {
   u32  rbag_use_A; // total rbag redex count (buffer A)
   u32  rbag_use_B; // total rbag redex count (buffer B)
-  Pair rbag_buf_A[G_RBAG_LEN]; // global redex bag (buffer A)
-  Pair rbag_buf_B[G_RBAG_LEN]; // global redex bag (buffer B)
-  Pair node_buf[G_NODE_LEN]; // global node buffer
-  Port vars_buf[G_VARS_LEN]; // global vars buffer
+  // Device pointers: inline arrays exceed MSVC's 2 GiB object limit (same as the C runtime).
+  Pair *rbag_buf_A; // global redex bag (buffer A)
+  Pair *rbag_buf_B; // global redex bag (buffer B)
+  Pair *node_buf; // global node buffer
+  Port *vars_buf; // global vars buffer
   u32  node_put[TPB*BPG];
   u32  vars_put[TPB*BPG];
   u32  rbag_pos[TPB*BPG];
@@ -242,11 +265,20 @@ __device__ __host__ f32 clamp(f32 x, f32 min, f32 max) {
   return (t > max) ? max : t;
 }
 
-// TODO: write a time64() function that returns the time as fast as possible as a u64
+// Host-only clock. Device code never calls this.
 static inline u64 time64() {
+#ifdef _WIN32
+  LARGE_INTEGER freq, now;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&now);
+  unsigned long long q = (unsigned long long)now.QuadPart;
+  unsigned long long f = (unsigned long long)freq.QuadPart;
+  return (q / f) * 1000000000ULL + ((q % f) * 1000000000ULL) / f;
+#else
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+#endif
 }
 
 __device__ inline u32 TID() {
@@ -1549,7 +1581,7 @@ __global__ void inbetween(GNet* gnet) {
 
 // EVAL
 __global__ void evaluator(GNet* gnet) {
-  extern __shared__ char shared_mem[]; // 96 KB
+  extern __shared__ char shared_mem[]; // sizeof(LNet)
   __shared__ Pair spawn[TPB]; // thread initialized
 
   // Thread Memory
@@ -1773,11 +1805,39 @@ __global__ void initialize(GNet* gnet) {
   }
 }
 
+static Pair *h_node_buf = NULL;
+static Port *h_vars_buf = NULL;
+static Pair *h_rbag_buf_A = NULL;
+static Pair *h_rbag_buf_B = NULL;
+
 GNet* gnet_create() {
+  GNet host;
+  memset(&host, 0, sizeof(host));
+
+  if (cudaMalloc((void**)&host.node_buf, (size_t)G_NODE_LEN * sizeof(Pair)) != cudaSuccess
+      || cudaMalloc((void**)&host.vars_buf, (size_t)G_VARS_LEN * sizeof(Port)) != cudaSuccess
+      || cudaMalloc((void**)&host.rbag_buf_A, (size_t)G_RBAG_LEN * sizeof(Pair)) != cudaSuccess
+      || cudaMalloc((void**)&host.rbag_buf_B, (size_t)G_RBAG_LEN * sizeof(Pair)) != cudaSuccess) {
+    fprintf(stderr, "HVM-CUDA: out of GPU memory allocating net buffers.\n");
+    exit(1);
+  }
+  cudaMemset(host.node_buf, 0, (size_t)G_NODE_LEN * sizeof(Pair));
+  cudaMemset(host.vars_buf, 0, (size_t)G_VARS_LEN * sizeof(Port));
+  cudaMemset(host.rbag_buf_A, 0, (size_t)G_RBAG_LEN * sizeof(Pair));
+  cudaMemset(host.rbag_buf_B, 0, (size_t)G_RBAG_LEN * sizeof(Pair));
+
+  h_node_buf = host.node_buf;
+  h_vars_buf = host.vars_buf;
+  h_rbag_buf_A = host.rbag_buf_A;
+  h_rbag_buf_B = host.rbag_buf_B;
+
   GNet *gnet;
-  cudaMalloc((void**)&gnet, sizeof(GNet));
+  if (cudaMalloc((void**)&gnet, sizeof(GNet)) != cudaSuccess) {
+    fprintf(stderr, "HVM-CUDA: out of GPU memory allocating GNet.\n");
+    exit(1);
+  }
+  cudaMemcpy(gnet, &host, sizeof(GNet), cudaMemcpyHostToDevice);
   initialize<<<BPG, TPB>>>(gnet);
-  //cudaMemset(gnet, 0, sizeof(GNet));
   return gnet;
 }
 
@@ -1840,21 +1900,24 @@ void gnet_normalize(GNet* gnet) {
 
 // Reads a device node to host
 Pair gnet_node_load(GNet* gnet, u32 loc) {
+  (void)gnet;
   Pair pair;
-  cudaMemcpy(&pair, &gnet->node_buf[loc], sizeof(Pair), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&pair, h_node_buf + loc, sizeof(Pair), cudaMemcpyDeviceToHost);
   return pair;
 }
 
 // Reads a device var to host
 Port gnet_vars_load(GNet* gnet, u32 loc) {
-  Pair port;
-  cudaMemcpy(&port, &gnet->vars_buf[loc], sizeof(Port), cudaMemcpyDeviceToHost);
+  (void)gnet;
+  Port port;
+  cudaMemcpy(&port, h_vars_buf + loc, sizeof(Port), cudaMemcpyDeviceToHost);
   return port;
 }
 
 // Writes a host var to device
 void gnet_vars_create(GNet* gnet, u32 var, Port val) {
-  cudaMemcpy(&gnet->vars_buf[var], &val, sizeof(Port), cudaMemcpyHostToDevice);
+  (void)gnet;
+  cudaMemcpy(h_vars_buf + var, &val, sizeof(Port), cudaMemcpyHostToDevice);
 }
 
 // Like the enter() function, but from host and read-only

@@ -58,7 +58,15 @@ cargo install --git https://github.com/Lyamc/HVM2 --locked
 
 Keep `PATH` short before calling `vcvars64` if you see `The input line is too long`.
 
-`build.rs` passes `/std:c11 /experimental:c11atomics` to `cl`. The C runtime heap-allocates the interaction-net buffers and typically needs **several gigabytes of RAM** (about 6 GiB plus ~128 MiB per worker thread).
+`build.rs` passes `/std:c11 /experimental:c11atomics` to `cl`. The C runtime heap-allocates the interaction-net buffers and typically needs **several gigabytes of RAM** (about 6 GiB plus ~128 MiB per compiled worker slot). Worker count is `min(physical cores, 16)` at compile time (`HVM_TPC_L2` overrides the log2). At run time, `hvm run-c --threads N` or `HVM_THREADS` can use fewer workers than that compile-time TPC.
+
+The CUDA runtime is compiled when `nvcc` is on `PATH` or under `CUDA_PATH`. Host code is C++17. Shared-memory `LNet` is 48 KiB so Ampere sm_86 (RTX 3060 class, 99 KiB/block) can launch; Ada 40-series still runs via sm_86 PTX. Rebuild after installing CUDA:
+
+```bat
+set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin;%PATH%"
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+cargo install --path . --locked
+```
 
 Standalone C from `hvm gen-c file.hvm > file.c`:
 
@@ -84,11 +92,11 @@ gcc -O3 -std=c11 -ffunction-sections -fdata-sections file.c -o file.exe -Wl,--gc
 There are multiple ways to run an HVM program:
 
 ```sh
-hvm run    <file.hvm> # interpret via Rust
-hvm run-c  <file.hvm> # interpret via C
-hvm run-cu <file.hvm> # interpret via CUDA
-hvm gen-c  <file.hvm> # compile to standalone C
-hvm gen-cu <file.hvm> # compile to standalone CUDA
+hvm run    <file.hvm>              # interpret via Rust (parallel; --threads 1 for sequential)
+hvm run-c  <file.hvm>              # interpret via C (parallel; --threads N / HVM_THREADS)
+hvm run-cu <file.hvm>              # interpret via CUDA
+hvm gen-c  <file.hvm>              # compile to standalone C
+hvm gen-cu <file.hvm>              # compile to standalone CUDA
 ```
 
 All modes produce the same output. The compiled modes require you to compile the

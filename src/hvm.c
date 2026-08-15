@@ -52,6 +52,30 @@ typedef _Atomic(u64) a64;
 #endif
 #define TPC (1ul << TPC_L2)
 
+// Live worker count (<= TPC). 0 means "not set yet" (see hvm_threads).
+static u32 hvm_nthreads = 0;
+
+void hvm_set_threads(u32 n) {
+  if (n < 1) n = 1;
+  if (n > TPC) n = TPC;
+  hvm_nthreads = n;
+}
+
+static u32 hvm_threads(void) {
+  if (hvm_nthreads == 0) {
+    u32 n = TPC;
+    const char *e = getenv("HVM_THREADS");
+    if (e && e[0]) {
+      int v = atoi(e);
+      if (v < 1) v = 1;
+      n = (u32)v;
+      if (n > TPC) n = TPC;
+    }
+    hvm_nthreads = n;
+  }
+  return hvm_nthreads;
+}
+
 // Types
 // -----
 
@@ -284,8 +308,9 @@ static inline f32 clamp(f32 x, f32 lo, f32 hi) {
 a64 a_reached = 0; // number of threads that reached the current barrier
 a64 a_barrier = 0; // number of barriers passed during this program
 void sync_threads() {
+  u32 nthr = hvm_threads();
   u64 barrier_old = atomic_load_explicit(&a_barrier, memory_order_relaxed);
-  if (atomic_fetch_add_explicit(&a_reached, 1, memory_order_relaxed) == (TPC - 1)) {
+  if (atomic_fetch_add_explicit(&a_reached, 1, memory_order_relaxed) == (nthr - 1)) {
     // Last thread to reach the barrier resets the counter and advances the barrier
     atomic_store_explicit(&a_reached, 0, memory_order_relaxed);
     atomic_store_explicit(&a_barrier, barrier_old + 1, memory_order_release);
@@ -1161,8 +1186,9 @@ static inline bool interact(Net* net, TM* tm, Book* book) {
 // ---------
 
 void evaluator(Net* net, TM* tm, Book* book) {
+  u32 nthr = hvm_threads();
   // Initializes the global idle counter
-  atomic_store_explicit(&net->idle, TPC - 1, memory_order_relaxed);
+  atomic_store_explicit(&net->idle, nthr - 1, memory_order_relaxed);
   sync_threads();
 
   // Performs some interactions
@@ -1190,7 +1216,7 @@ void evaluator(Net* net, TM* tm, Book* book) {
       busy = false;
 
       //// Peeks a redex from target
-      u32 sid = (tm->tid - 1) % TPC;
+      u32 sid = (tm->tid - 1) % nthr;
       u32 idx = sid*(G_RBAG_LEN/TPC) + (tm->sidx++);
 
       // Stealing Everything: this will steal all redexes
@@ -1207,7 +1233,7 @@ void evaluator(Net* net, TM* tm, Book* book) {
       hvm_yield();
       // Halt if all threads are idle
       if (tick % 256 == 0) {
-        if (atomic_load_explicit(&net->idle, memory_order_relaxed) == TPC) {
+        if (atomic_load_explicit(&net->idle, memory_order_relaxed) == nthr) {
           break;
         }
       }
@@ -1253,9 +1279,11 @@ void boot_redex(Net* net, Pair redex) {
 // Evaluates all redexes.
 // TODO: cache threads to avoid spawning overhead
 void normalize(Net* net, Book* book) {
+  u32 nthr = hvm_threads();
+
   // Inits thread_arg objects
   ThreadArg thread_arg[TPC];
-  for (u32 t = 0; t < TPC; ++t) {
+  for (u32 t = 0; t < nthr; ++t) {
     thread_arg[t].net  = net;
     thread_arg[t].tm   = tm[t];
     thread_arg[t].book = book;
@@ -1263,12 +1291,12 @@ void normalize(Net* net, Book* book) {
 
   // Spawns the evaluation threads
   hvm_thread_t threads[TPC];
-  for (u32 t = 0; t < TPC; ++t) {
+  for (u32 t = 0; t < nthr; ++t) {
     hvm_thread_spawn(&threads[t], thread_func, &thread_arg[t]);
   }
 
   // Wait for the threads to finish
-  for (u32 t = 0; t < TPC; ++t) {
+  for (u32 t = 0; t < nthr; ++t) {
     hvm_thread_join(threads[t]);
   }
 }
@@ -1801,11 +1829,11 @@ void hvm_c(u32* book_buffer) {
     }
   }
 
+  // Starts the timer (includes net calloc; hello MIPS is otherwise nonsense)
+  u64 start = time64();
+
   // GMem
   Net *net = net_new();
-
-  // Starts the timer
-  u64 start = time64();
 
   // Creates an initial redex that calls main
   boot_redex(net, new_pair(new_port(REF, 0), ROOT));

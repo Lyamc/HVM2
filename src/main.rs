@@ -2,8 +2,9 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use ::hvm::{ast, cmp, hvm};
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -12,11 +13,38 @@ use std::process::Command as SysCommand;
 #[cfg(feature = "c")]
 extern "C" {
   fn hvm_c(book_buffer: *const u32);
+  fn hvm_set_threads(n: u32);
 }
 
 #[cfg(feature = "cuda")]
 extern "C" {
   fn hvm_cu(book_buffer: *const u32);
+}
+
+fn default_threads(parallel: bool) -> u32 {
+  if let Ok(v) = env::var("HVM_THREADS") {
+    if let Ok(n) = v.parse::<u32>() {
+      return n.max(1).min(32);
+    }
+  }
+  if parallel {
+    (num_cpus::get_physical() as u32).clamp(1, 16)
+  } else {
+    // Rust steal pool is opt-in (--threads / HVM_THREADS); not yet as stable as C.
+    1
+  }
+}
+
+fn threads_arg() -> Arg {
+  Arg::new("threads")
+    .long("threads")
+    .short('t')
+    .value_parser(clap::value_parser!(u32))
+    .help("Worker threads. run-c defaults to min(physical, 16); run defaults to 1. Also HVM_THREADS.")
+}
+
+fn cli_threads(sub: &ArgMatches, parallel: bool) -> u32 {
+  sub.get_one::<u32>("threads").copied().unwrap_or_else(|| default_threads(parallel))
 }
 
 fn main() {
@@ -28,11 +56,13 @@ fn main() {
     .subcommand(
       Command::new("run")
         .about("Interprets a file (using Rust)")
-        .arg(Arg::new("file").required(true)))
+        .arg(Arg::new("file").required(true))
+        .arg(threads_arg()))
     .subcommand(
       Command::new("run-c")
         .about("Interprets a file (using C)")
         .arg(Arg::new("file").required(true))
+        .arg(threads_arg())
         .arg(Arg::new("io")
           .long("io")
           .action(ArgAction::SetTrue)
@@ -67,18 +97,21 @@ fn main() {
   match matches.subcommand() {
     Some(("run", sub_matches)) => {
       let file = sub_matches.get_one::<String>("file").expect("required");
+      let threads = cli_threads(sub_matches, false);
       let code = fs::read_to_string(file).expect("Unable to read file");
       let book = ast::Book::parse(&code).unwrap_or_else(|er| panic!("{}",er)).build();
-      run(&book);
+      run(&book, threads);
     }
     Some(("run-c", sub_matches)) => {
       let file = sub_matches.get_one::<String>("file").expect("required");
+      let threads = cli_threads(sub_matches, true);
       let code = fs::read_to_string(file).expect("Unable to read file");
       let book = ast::Book::parse(&code).unwrap_or_else(|er| panic!("{}",er)).build();
       let mut data : Vec<u8> = Vec::new();
       book.to_buffer(&mut data);
       #[cfg(feature = "c")]
       unsafe {
+        hvm_set_threads(threads);
         hvm_c(data.as_mut_ptr() as *mut u32);
       }
       #[cfg(not(feature = "c"))]
@@ -104,8 +137,9 @@ fn main() {
       let book = ast::Book::parse(&code).unwrap_or_else(|er| panic!("{}",er)).build();
 
       // Gets optimal core count
-      let cores = num_cpus::get();
-      let tpcl2 = (cores as f64).log2().floor() as u32;
+      let cores = num_cpus::get_physical().max(1);
+      let mut tpcl2 = (cores as f64).log2().floor() as u32;
+      if tpcl2 > 4 { tpcl2 = 4; }
 
       // Generates the interpreted book
       let mut book_buf : Vec<u8> = Vec::new();
@@ -157,23 +191,26 @@ fn main() {
   }
 }
 
-pub fn run(book: &hvm::Book) {
+pub fn run(book: &hvm::Book, threads: u32) {
   // Initializes the global net
   let net = hvm::GNet::new(1 << 29, 1 << 29);
 
-  // Initializes threads
-  let mut tm = hvm::TMem::new(0, 1);
-
   // Creates an initial redex that calls main
   let main_id = book.defs.iter().position(|def| def.name == "main").unwrap();
-  tm.rbag.push_redex(hvm::Pair::new(hvm::Port::new(hvm::REF, main_id as u32), hvm::ROOT));
+  let boot = hvm::Pair::new(hvm::Port::new(hvm::REF, main_id as u32), hvm::ROOT);
   net.vars_create(hvm::ROOT.get_val() as usize, hvm::NONE);
 
   // Starts the timer
   let start = std::time::Instant::now();
 
   // Evaluates
-  tm.evaluator(&net, &book);
+  if threads <= 1 {
+    let mut tm = hvm::TMem::new(0, 1);
+    tm.rbag.push_redex(boot);
+    tm.evaluator(&net, book);
+  } else {
+    hvm::TMem::evaluator_pool(&net, book, boot, threads);
+  }
   
   // Stops the timer
   let duration = start.elapsed();
