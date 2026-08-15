@@ -147,10 +147,10 @@ struct RBag {
   Pair lo_buf[RLEN];
 };
 
-// Local Net: 0x1C00 → 56 slots/thread (radix is 53 nodes). sizeof(LNet)=86 KiB
-// plus 1 KiB spawn stays under sm_86's 99 KiB/block cap.
-const u32 L_NODE_LEN = 0x1C00;
-const u32 L_VARS_LEN = 0x1C00;
+// Local Net: 0x2000 → 64 slots/thread, 96 KiB + 1 KiB spawn = 97 KiB.
+// sm_86 allows 99 KiB/block. Needed so radix (53 nodes) and the live sort net fit.
+const u32 L_NODE_LEN = 0x2000;
+const u32 L_VARS_LEN = 0x2000;
 struct LNet {
   Pair node_buf[L_NODE_LEN];
   Port vars_buf[L_VARS_LEN];
@@ -909,38 +909,58 @@ __device__ inline Port vars_take(Net* net, u32 var) {
 // Allocator
 // ---------
 
+// Shared overflow bump so a hot GID is not stuck with only G_NODE_LEN/TPG slots.
+__device__ unsigned int g_node_rover = 0;
+__device__ unsigned int g_vars_rover = 0;
+
 template <typename A>
-__device__ u32 g_alloc_1(Net* net, u32* g_put, A* g_buf) {
-  u32 lps = 0;
-  while (true) {
-    u32 lc = GID()*(G_NODE_LEN/TPG) + (*g_put%(G_NODE_LEN/TPG));
+__device__ u32 g_alloc_rover_1(A* g_buf, unsigned int* rover) {
+  u32 span = G_NODE_LEN - L_NODE_LEN;
+  if (span == 0) return 0;
+  for (u32 t = 0; t < 4096; ++t) {
+    u32 raw = atomicAdd(rover, 1u);
+    u32 lc = L_NODE_LEN + (raw % span);
+    if (g_buf[lc] == 0) {
+      return lc;
+    }
+  }
+  return 0;
+}
+
+template <typename A>
+__device__ u32 g_alloc_1(Net* net, u32* g_put, A* g_buf, unsigned int* rover) {
+  u32 span = G_NODE_LEN / TPG;
+  for (u32 t = 0; t < span; ++t) {
+    u32 lc = GID() * span + (*g_put % span);
     A elem = g_buf[lc];
     *g_put += 1;
     if (lc >= L_NODE_LEN && elem == 0) {
       return lc;
     }
-    if (++lps >= G_NODE_LEN/TPG) printf("OOM\n"); // FIXME: remove
-    //assert(++lps < G_NODE_LEN/TPG); // FIXME: enable?
   }
+  return g_alloc_rover_1(g_buf, rover);
 }
 
 template <typename A>
-__device__ u32 g_alloc(Net* net, u32* ret, u32* g_put, A* g_buf, u32 num) {
+__device__ u32 g_alloc(Net* net, u32* ret, u32* g_put, A* g_buf, unsigned int* rover, u32 num) {
   u32 got = 0;
-  u32 lps = 0;
-  while (got < num) {
-    u32 lc = GID()*(G_NODE_LEN/TPG) + (*g_put%(G_NODE_LEN/TPG));
+  u32 span = G_NODE_LEN / TPG;
+  for (u32 t = 0; t < span && got < num; ++t) {
+    u32 lc = GID() * span + (*g_put % span);
     A elem = g_buf[lc];
     *g_put += 1;
     if (lc >= L_NODE_LEN && elem == 0) {
       ret[got++] = lc;
     }
-
-    if (++lps >= G_NODE_LEN/TPG) printf("OOM\n"); // FIXME: remove
-    //assert(++lps < G_NODE_LEN/TPG); // FIXME: enable?
+  }
+  while (got < num) {
+    u32 lc = g_alloc_rover_1(g_buf, rover);
+    if (lc == 0) {
+      break;
+    }
+    ret[got++] = lc;
   }
   return got;
-
 }
 
 template <typename A>
@@ -977,19 +997,19 @@ __device__ u32 l_alloc_1(Net* net, u32* ret, u32* l_put, A* l_buf, u32* lps) {
 }
 
 __device__ u32 g_node_alloc_1(Net* net) {
-  return g_alloc_1(net, net->g_node_put, net->g_node_buf);
+  return g_alloc_1(net, net->g_node_put, net->g_node_buf, &g_node_rover);
 }
 
 __device__ u32 g_vars_alloc_1(Net* net) {
-  return g_alloc_1(net, net->g_vars_put, net->g_vars_buf);
+  return g_alloc_1(net, net->g_vars_put, net->g_vars_buf, &g_vars_rover);
 }
 
 __device__ u32 g_node_alloc(Net* net, TM* tm, u32 num) {
-  return g_alloc(net, tm->nloc, net->g_node_put, net->g_node_buf, num);
+  return g_alloc(net, tm->nloc, net->g_node_put, net->g_node_buf, &g_node_rover, num);
 }
 
 __device__ u32 g_vars_alloc(Net* net, TM* tm, u32 num) {
-  return g_alloc(net, tm->vloc, net->g_vars_put, net->g_vars_buf, num);
+  return g_alloc(net, tm->vloc, net->g_vars_put, net->g_vars_buf, &g_vars_rover, num);
 }
 
 __device__ u32 l_node_alloc(Net* net, TM* tm, u32 num) {
@@ -1797,6 +1817,10 @@ __global__ void initialize(GNet* gnet) {
   gnet->node_put[GID()] = 0;
   gnet->vars_put[GID()] = 0;
   gnet->rbag_pos[GID()] = 0;
+  if (GID() == 0) {
+    g_node_rover = 0;
+    g_vars_rover = 0;
+  }
   for (u32 i = 0; i < RLEN; ++i) {
     gnet->rbag_buf_A[G_RBAG_LEN / TPG * GID() + i] = 0;
   }

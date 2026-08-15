@@ -94,6 +94,8 @@ pub struct GNet<'a> {
   pub node: &'a mut [APair], // node buffer
   pub vars: &'a mut [APort], // vars buffer
   pub itrs: AtomicU64, // interaction count
+  pub nalloc: AtomicU64, // shared bump for multi-thread alloc
+  pub valloc: AtomicU64,
 }
 
 // Thread Memory
@@ -460,7 +462,7 @@ impl<'a> GNet<'a> {
     let vptr = unsafe { alloc(vlay) as *mut APort };
     let node = unsafe { std::slice::from_raw_parts_mut(nptr, nlen) };
     let vars = unsafe { std::slice::from_raw_parts_mut(vptr, vlen) };
-    GNet { nlen, vlen, node, vars, itrs: AtomicU64::new(0) }
+    GNet { nlen, vlen, node, vars, itrs: AtomicU64::new(0), nalloc: AtomicU64::new(0), valloc: AtomicU64::new(0) }
   }
 
   pub fn node_create(&self, loc: usize, val: Pair) {
@@ -573,14 +575,23 @@ impl TMem {
 
   pub fn node_alloc(&mut self, net: &GNet, num: usize) -> usize {
     let mut got = 0;
-    for _ in 0..net.nlen {
-      self.nput += 1; // index 0 reserved
-      if self.tids > 1 {
-        let (base, end) = self.alloc_range(net.nlen);
-        if self.nput >= end || self.nput == 0 {
-          self.nput = base.max(1);
+    if self.tids > 1 {
+      let mut tries = 0;
+      while got < num && tries < net.nlen {
+        tries += 1;
+        let i = (net.nalloc.fetch_add(1, Ordering::Relaxed) as usize + 1) % net.nlen;
+        if i == 0 {
+          continue;
+        }
+        if i < net.nlen - 1 || net.is_node_free(i) {
+          self.nloc[got] = i;
+          got += 1;
         }
       }
+      return got;
+    }
+    for _ in 0..net.nlen {
+      self.nput += 1; // index 0 reserved
       if self.nput < net.nlen-1 || net.is_node_free(self.nput % net.nlen) {
         self.nloc[got] = self.nput % net.nlen;
         got += 1;
@@ -594,14 +605,23 @@ impl TMem {
 
   pub fn vars_alloc(&mut self, net: &GNet, num: usize) -> usize {
     let mut got = 0;
-    for _ in 0..net.vlen {
-      self.vput += 1; // index 0 reserved for FREE
-      if self.tids > 1 {
-        let (base, end) = self.alloc_range(net.vlen);
-        if self.vput >= end || self.vput == 0 {
-          self.vput = base.max(1);
+    if self.tids > 1 {
+      let mut tries = 0;
+      while got < num && tries < net.vlen {
+        tries += 1;
+        let i = (net.valloc.fetch_add(1, Ordering::Relaxed) as usize + 1) % net.vlen;
+        if i == 0 {
+          continue;
+        }
+        if i < net.vlen - 1 || net.is_vars_free(i) {
+          self.vloc[got] = i;
+          got += 1;
         }
       }
+      return got;
+    }
+    for _ in 0..net.vlen {
+      self.vput += 1; // index 0 reserved for FREE
       if self.vput < net.vlen-1 || net.is_vars_free(self.vput % net.nlen) {
         self.vloc[got] = self.vput % net.nlen;
         got += 1;
@@ -975,7 +995,7 @@ impl TMem {
     self.itrs = 0;
   }
 
-  /// Multi-thread evaluator with a shared steal bag per worker.
+  /// Multi-thread evaluator. Shared bump alloc + one steal bag per worker.
   pub fn evaluator_pool(net: &GNet, book: &Book, boot: Pair, nthreads: u32) {
     let n = nthreads.max(1) as usize;
     let idle = AtomicU32::new(n as u32);
@@ -988,18 +1008,12 @@ impl TMem {
         let idle = &idle;
         scope.spawn(move || {
           let mut tm = TMem::new(tid as u32, n as u32);
-          let (nbase, _) = tm.alloc_range(net.nlen);
-          let (vbase, _) = tm.alloc_range(net.vlen);
-          tm.nput = nbase;
-          tm.vput = vbase;
-
           let mut busy = false;
-          let mut tick = 0u32;
+          let mut spins = 0u32;
           loop {
-            tick = tick.wrapping_add(1);
             if tm.rbag.len() == 0 {
               for k in 0..n {
-                let j = (tid + k) % n;
+                let j = (tid + 1 + k) % n;
                 if let Ok(mut g) = bags[j].try_lock() {
                   if let Some(r) = g.pop() {
                     tm.rbag.push_redex(r);
@@ -1014,8 +1028,9 @@ impl TMem {
                 idle.fetch_sub(1, Ordering::Relaxed);
                 busy = true;
               }
+              spins = 0;
               tm.interact(net, book);
-              if tm.rbag.lo.len() > 64 {
+              if tm.rbag.lo.len() > 32 {
                 if let Ok(mut g) = bags[tid].try_lock() {
                   let take = tm.rbag.lo.len() / 2;
                   g.extend(tm.rbag.lo.drain(..take));
@@ -1026,9 +1041,10 @@ impl TMem {
                 idle.fetch_add(1, Ordering::Relaxed);
                 busy = false;
               }
-              if tick % 64 == 0 && idle.load(Ordering::Relaxed) == n as u32 {
+              spins = spins.saturating_add(1);
+              if spins > 256 && idle.load(Ordering::SeqCst) == n as u32 {
                 let empty = bags.iter().all(|b| b.lock().map(|g| g.is_empty()).unwrap_or(false));
-                if empty {
+                if empty && tm.rbag.len() == 0 {
                   break;
                 }
               }

@@ -1277,11 +1277,9 @@ void boot_redex(Net* net, Pair redex) {
 }
 
 // Evaluates all redexes.
-// TODO: cache threads to avoid spawning overhead
 void normalize(Net* net, Book* book) {
   u32 nthr = hvm_threads();
 
-  // Inits thread_arg objects
   ThreadArg thread_arg[TPC];
   for (u32 t = 0; t < nthr; ++t) {
     thread_arg[t].net  = net;
@@ -1289,13 +1287,10 @@ void normalize(Net* net, Book* book) {
     thread_arg[t].book = book;
   }
 
-  // Spawns the evaluation threads
   hvm_thread_t threads[TPC];
   for (u32 t = 0; t < nthr; ++t) {
     hvm_thread_spawn(&threads[t], thread_func, &thread_arg[t]);
   }
-
-  // Wait for the threads to finish
   for (u32 t = 0; t < nthr; ++t) {
     hvm_thread_join(threads[t]);
   }
