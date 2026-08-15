@@ -30,8 +30,8 @@ fn default_threads(parallel: bool) -> u32 {
   if parallel {
     (num_cpus::get_physical() as u32).clamp(1, 16)
   } else {
-    // Rust steal pool is opt-in (--threads / HVM_THREADS); not yet as stable as C.
-    1
+    // Lock-free steal; 8 is the sweet spot (16 oversubscribes). 1 still works via --threads 1.
+    (num_cpus::get_physical() as u32).clamp(1, 8)
   }
 }
 
@@ -40,7 +40,7 @@ fn threads_arg() -> Arg {
     .long("threads")
     .short('t')
     .value_parser(clap::value_parser!(u32))
-    .help("Worker threads. run-c defaults to min(physical, 16); run defaults to 1. Also HVM_THREADS.")
+    .help("Worker threads. run-c: min(physical, 16). run: min(physical, 8) lock-free pool. Also HVM_THREADS.")
 }
 
 fn cli_threads(sub: &ArgMatches, parallel: bool) -> u32 {
@@ -193,7 +193,11 @@ fn main() {
 
 pub fn run(book: &hvm::Book, threads: u32) {
   // Initializes the global net
-  let net = hvm::GNet::new(1 << 29, 1 << 29);
+  let net = if threads > 1 {
+    hvm::GNet::with_workers(1 << 29, 1 << 29, threads)
+  } else {
+    hvm::GNet::new(1 << 29, 1 << 29)
+  };
 
   // Creates an initial redex that calls main
   let main_id = book.defs.iter().position(|def| def.name == "main").unwrap();

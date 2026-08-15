@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::alloc::{alloc, dealloc, Layout};
 use std::mem;
 
@@ -93,9 +92,11 @@ pub struct GNet<'a> {
   pub vlen: usize, // length of the vars buffer
   pub node: &'a mut [APair], // node buffer
   pub vars: &'a mut [APort], // vars buffer
+  pub rbag: &'a mut [APair], // lock-free steal bags (nthreads * rspan)
+  pub rspan: usize, // slots per worker
+  pub nthreads: u32,
+  pub idle: AtomicU32,
   pub itrs: AtomicU64, // interaction count
-  pub nalloc: AtomicU64, // shared bump for multi-thread alloc
-  pub valloc: AtomicU64,
 }
 
 // Thread Memory
@@ -106,9 +107,13 @@ pub struct TMem {
   pub itrs: u32, // interaction count
   pub nput: usize, // next node allocation index
   pub vput: usize, // next vars allocation index
+  pub rput: usize, // next steal-bag push index
+  pub sidx: usize, // steal scan index
+  pub nwrap: bool,
+  pub vwrap: bool,
   pub nloc: Vec<usize>, // allocated node locations
   pub vloc: Vec<usize>, // allocated vars locations
-  pub rbag: RBag, // local redex bag
+  pub rbag: RBag, // local high-priority redex bag
 }
 
 // Top-Level Definition
@@ -456,13 +461,36 @@ impl RBag {
 
 impl<'a> GNet<'a> {
   pub fn new(nlen: usize, vlen: usize) -> Self {
+    Self::with_workers(nlen, vlen, 1)
+  }
+
+  pub fn with_workers(nlen: usize, vlen: usize, nthreads: u32) -> Self {
+    let nthreads = nthreads.max(1);
+    let rspan = if nthreads > 1 { 1 << 18 } else { 0 };
+    let rlen = rspan * nthreads as usize;
     let nlay = Layout::array::<APair>(nlen).unwrap();
     let vlay = Layout::array::<APort>(vlen).unwrap();
+    let rlay = Layout::array::<APair>(rlen.max(1)).unwrap();
     let nptr = unsafe { alloc(nlay) as *mut APair };
     let vptr = unsafe { alloc(vlay) as *mut APort };
+    let rptr = unsafe { alloc(rlay) as *mut APair };
     let node = unsafe { std::slice::from_raw_parts_mut(nptr, nlen) };
     let vars = unsafe { std::slice::from_raw_parts_mut(vptr, vlen) };
-    GNet { nlen, vlen, node, vars, itrs: AtomicU64::new(0), nalloc: AtomicU64::new(0), valloc: AtomicU64::new(0) }
+    let rbag = unsafe { std::slice::from_raw_parts_mut(rptr, rlen.max(1)) };
+    for slot in rbag.iter_mut() {
+      slot.0 = AtomicU64::new(0);
+    }
+    GNet {
+      nlen,
+      vlen,
+      node,
+      vars,
+      rbag,
+      rspan,
+      nthreads,
+      idle: AtomicU32::new(0),
+      itrs: AtomicU64::new(0),
+    }
   }
 
   pub fn node_create(&self, loc: usize, val: Pair) {
@@ -538,10 +566,12 @@ unsafe impl Send for GNet<'_> {}
 impl<'a> Drop for GNet<'a> {
   fn drop(&mut self) {
     let nlay = Layout::array::<APair>(self.nlen).unwrap();
-    let vlay = Layout::array::<APair>(self.vlen).unwrap();
+    let vlay = Layout::array::<APort>(self.vlen).unwrap();
+    let rlay = Layout::array::<APair>(self.rbag.len().max(1)).unwrap();
     unsafe {
       dealloc(self.node.as_mut_ptr() as *mut u8, nlay);
       dealloc(self.vars.as_mut_ptr() as *mut u8, vlay);
+      dealloc(self.rbag.as_mut_ptr() as *mut u8, rlay);
     }
   }
 
@@ -557,6 +587,10 @@ impl TMem {
       itrs: 0,
       nput: 0,
       vput: 0,
+      rput: 0,
+      sidx: 0,
+      nwrap: false,
+      vwrap: false,
       nloc: vec![0; 0xFFF], // FIXME: move to a constant
       vloc: vec![0; 0xFFF],
       rbag: RBag::new(),
@@ -575,27 +609,19 @@ impl TMem {
 
   pub fn node_alloc(&mut self, net: &GNet, num: usize) -> usize {
     let mut got = 0;
-    if self.tids > 1 {
-      let mut tries = 0;
-      while got < num && tries < net.nlen {
-        tries += 1;
-        let i = (net.nalloc.fetch_add(1, Ordering::Relaxed) as usize + 1) % net.nlen;
-        if i == 0 {
-          continue;
-        }
-        if i < net.nlen - 1 || net.is_node_free(i) {
-          self.nloc[got] = i;
-          got += 1;
-        }
+    let (base, end) = self.alloc_range(net.nlen);
+    let limit = (end - base).max(1);
+    for _ in 0..limit {
+      self.nput += 1;
+      if self.nput >= end || self.nput == 0 {
+        self.nput = base.max(1);
+        self.nwrap = true;
       }
-      return got;
-    }
-    for _ in 0..net.nlen {
-      self.nput += 1; // index 0 reserved
-      if self.nput < net.nlen-1 || net.is_node_free(self.nput % net.nlen) {
-        self.nloc[got] = self.nput % net.nlen;
-        got += 1;
+      if self.nwrap && !net.is_node_free(self.nput) {
+        continue;
       }
+      self.nloc[got] = self.nput;
+      got += 1;
       if got >= num {
         break;
       }
@@ -605,32 +631,64 @@ impl TMem {
 
   pub fn vars_alloc(&mut self, net: &GNet, num: usize) -> usize {
     let mut got = 0;
-    if self.tids > 1 {
-      let mut tries = 0;
-      while got < num && tries < net.vlen {
-        tries += 1;
-        let i = (net.valloc.fetch_add(1, Ordering::Relaxed) as usize + 1) % net.vlen;
-        if i == 0 {
-          continue;
-        }
-        if i < net.vlen - 1 || net.is_vars_free(i) {
-          self.vloc[got] = i;
-          got += 1;
-        }
+    let (base, end) = self.alloc_range(net.vlen);
+    let limit = (end - base).max(1);
+    for _ in 0..limit {
+      self.vput += 1;
+      if self.vput >= end || self.vput == 0 {
+        self.vput = base.max(1);
+        self.vwrap = true;
       }
-      return got;
-    }
-    for _ in 0..net.vlen {
-      self.vput += 1; // index 0 reserved for FREE
-      if self.vput < net.vlen-1 || net.is_vars_free(self.vput % net.nlen) {
-        self.vloc[got] = self.vput % net.nlen;
-        got += 1;
+      if self.vwrap && !net.is_vars_free(self.vput) {
+        continue;
       }
+      self.vloc[got] = self.vput;
+      got += 1;
       if got >= num {
         break;
       }
     }
     got
+  }
+
+  fn emit(&mut self, net: &GNet, redex: Pair) {
+    let rule = Port::get_rule(redex.get_fst(), redex.get_snd());
+    if self.tids <= 1 || net.rspan == 0 || Port::is_high_priority(rule) {
+      self.rbag.push_redex(redex);
+      return;
+    }
+    let base = self.tid as usize * net.rspan;
+    if self.rput + 1 >= net.rspan {
+      self.rbag.push_redex(redex);
+      return;
+    }
+    let idx = base + self.rput;
+    self.rput += 1;
+    net.rbag[idx].0.store(redex.0, Ordering::Relaxed);
+  }
+
+  fn pop_local(&mut self) -> Option<Pair> {
+    self.rbag.pop_redex()
+  }
+
+  fn steal(&mut self, net: &GNet) -> Option<Pair> {
+    if net.rspan == 0 || net.nthreads <= 1 {
+      return None;
+    }
+    let n = net.nthreads as usize;
+    let sid = (self.tid as usize + n - 1) % n;
+    let base = sid * net.rspan;
+    let idx = base + (self.sidx % net.rspan);
+    self.sidx += 1;
+    if self.sidx >= net.rspan {
+      self.sidx = 0;
+    }
+    let got = net.rbag[idx].0.swap(0, Ordering::Relaxed);
+    if got == 0 {
+      None
+    } else {
+      Some(Pair(got))
+    }
   }
 
   pub fn get_resources(&mut self, net: &GNet, _need_rbag: usize, need_node: usize, need_vars: usize) -> bool {
@@ -654,7 +712,7 @@ impl TMem {
 
       // If `A` is NODE: create the `A ~ B` redex
       if a.get_tag() != VAR {
-        self.rbag.push_redex(Pair::new(a, b));
+        self.emit(net, Pair::new(a, b));
         break;
       }
 
@@ -902,9 +960,24 @@ impl TMem {
   }
 
   // Pops a local redex and performs a single interaction.
+  fn take_redex(&mut self, net: &GNet) -> Option<Pair> {
+    if let Some(redex) = self.rbag.pop_redex() {
+      return Some(redex);
+    }
+    if self.tids > 1 && net.rspan > 0 && self.rput > 0 {
+      self.rput -= 1;
+      let idx = self.tid as usize * net.rspan + self.rput;
+      let got = net.rbag[idx].0.swap(0, Ordering::Relaxed);
+      if got != 0 {
+        return Some(Pair(got));
+      }
+    }
+    self.steal(net)
+  }
+
   pub fn interact(&mut self, net: &GNet, book: &Book) -> bool {
     // Pops a redex.
-    let redex = match self.rbag.pop_redex() {
+    let redex = match self.take_redex(net) {
       Some(redex) => redex,
       None => return true, // If there is no redex, stop
     };
@@ -940,7 +1013,7 @@ impl TMem {
 
     // If error, pushes redex back.
     if !success {
-      self.rbag.push_redex(redex);
+      self.emit(net, redex);
       false
     // Else, increments the interaction count.
     } else if rule != LINK {
@@ -995,58 +1068,41 @@ impl TMem {
     self.itrs = 0;
   }
 
-  /// Multi-thread evaluator. Shared bump alloc + one steal bag per worker.
+  /// Lock-free worker pool: partitioned alloc + atomic steal bags (same shape as hvm.c).
   pub fn evaluator_pool(net: &GNet, book: &Book, boot: Pair, nthreads: u32) {
-    let n = nthreads.max(1) as usize;
-    let idle = AtomicU32::new(n as u32);
-    let bags: Vec<Mutex<Vec<Pair>>> = (0..n).map(|_| Mutex::new(Vec::new())).collect();
-    bags[0].lock().unwrap().push(boot);
+    let n = nthreads.max(1);
+    if net.rspan > 0 {
+      net.rbag[0].0.store(boot.0, Ordering::Relaxed);
+    }
+    net.idle.store(n.saturating_sub(1), Ordering::Relaxed);
 
     std::thread::scope(|scope| {
       for tid in 0..n {
-        let bags = &bags;
-        let idle = &idle;
         scope.spawn(move || {
-          let mut tm = TMem::new(tid as u32, n as u32);
-          let mut busy = false;
-          let mut spins = 0u32;
+          let mut tm = TMem::new(tid, n);
+          let (nbase, _) = tm.alloc_range(net.nlen);
+          let (vbase, _) = tm.alloc_range(net.vlen);
+          tm.nput = nbase;
+          tm.vput = vbase;
+          let mut busy = tid == 0;
+          let mut tick = 0u32;
           loop {
-            if tm.rbag.len() == 0 {
-              for k in 0..n {
-                let j = (tid + 1 + k) % n;
-                if let Ok(mut g) = bags[j].try_lock() {
-                  if let Some(r) = g.pop() {
-                    tm.rbag.push_redex(r);
-                    break;
-                  }
-                }
-              }
-            }
-
-            if tm.rbag.len() > 0 {
+            tick = tick.wrapping_add(1);
+            let had = tm.take_redex(net);
+            if let Some(redex) = had {
               if !busy {
-                idle.fetch_sub(1, Ordering::Relaxed);
+                net.idle.fetch_sub(1, Ordering::Relaxed);
                 busy = true;
               }
-              spins = 0;
+              tm.rbag.push_redex(redex);
               tm.interact(net, book);
-              if tm.rbag.lo.len() > 32 {
-                if let Ok(mut g) = bags[tid].try_lock() {
-                  let take = tm.rbag.lo.len() / 2;
-                  g.extend(tm.rbag.lo.drain(..take));
-                }
-              }
             } else {
               if busy {
-                idle.fetch_add(1, Ordering::Relaxed);
+                net.idle.fetch_add(1, Ordering::Relaxed);
                 busy = false;
               }
-              spins = spins.saturating_add(1);
-              if spins > 256 && idle.load(Ordering::SeqCst) == n as u32 {
-                let empty = bags.iter().all(|b| b.lock().map(|g| g.is_empty()).unwrap_or(false));
-                if empty && tm.rbag.len() == 0 {
-                  break;
-                }
+              if tick % 256 == 0 && net.idle.load(Ordering::Relaxed) == n {
+                break;
               }
               std::thread::yield_now();
             }
