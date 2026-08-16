@@ -78,6 +78,7 @@ const W_NWRAP: u32 = 2u;
 const W_VWRAP: u32 = 3u;
 const W_RLEN: u32 = 4u;
 const W_SIDX: u32 = 5u;
+const W_RPUT: u32 = 6u;
 const W_STRIDE: u32 = 8u;
 
 // VAR  REF  ERA  NUM  CON  DUP  OPR  SWI
@@ -101,6 +102,10 @@ var<private> vput: u32;
 var<private> nwrap: u32;
 var<private> vwrap: u32;
 var<private> g_tid: u32;
+var<private> g_nlen: u32;
+var<private> g_vlen: u32;
+var<private> g_nthreads: u32;
+var<private> g_rspan: u32;
 var<private> llo: array<u32, 64>;
 var<private> lhi: array<u32, 64>;
 var<private> ltop: u32;
@@ -132,72 +137,96 @@ fn unpack2(x: u64) -> vec2<u32> {
   return vec2<u32>(u32(x), u32(x >> 32u));
 }
 
+// NODE_ACCESS_START — replaced by a non-atomic copy when nthreads==1
+fn nld(i: u32) -> u64 { return atomicLoad(&node[i]); }
+fn nst(i: u32, v: u64) { atomicStore(&node[i], v); }
+fn nxchg(i: u32, v: u64) -> u64 { return atomicExchange(&node[i], v); }
+fn ncas0(i: u32) -> bool { return atomicCompareExchangeWeak(&node[i], u64(0), u64(1)).exchanged; }
+fn vld(i: u32) -> u32 { return atomicLoad(&vars[i]); }
+fn vst(i: u32, v: u32) { atomicStore(&vars[i], v); }
+fn vxchg(i: u32, v: u32) -> u32 { return atomicExchange(&vars[i], v); }
+fn vcas(i: u32, exp: u32, v: u32) -> bool { return atomicCompareExchangeWeak(&vars[i], exp, v).exchanged; }
+// NODE_ACCESS_END
+
 fn node_empty(i: u32) -> bool {
-  return atomicLoad(&node[i]) == u64(0);
+  return nld(i) == u64(0);
 }
 
 fn node_load(i: u32) -> vec2<u32> {
-  return unpack2(atomicLoad(&node[i]));
+  return unpack2(nld(i));
 }
 
 fn node_store(i: u32, p: vec2<u32>) {
-  atomicStore(&node[i], pack2(p.x, p.y));
+  nst(i, pack2(p.x, p.y));
 }
 
 fn node_take(i: u32) -> vec2<u32> {
-  return unpack2(atomicExchange(&node[i], u64(0)));
+  return unpack2(nxchg(i, u64(0)));
 }
 
 fn wf(tid: u32, field: u32) -> u32 {
   return tid * W_STRIDE + field;
 }
 
+// Own bag is a C-style stack: store at rput++, pop from --rput. Stealers
+// only exchange holes; they do not walk the whole stripe.
+fn pop_own() -> vec3<u32> {
+  let rspan = g_rspan;
+  let rp = atomicLoad(&worker[wf(g_tid, W_RPUT)]);
+  if rp == 0u { return vec3<u32>(0u, 0u, 0u); }
+  let nput = rp - 1u;
+  atomicStore(&worker[wf(g_tid, W_RPUT)], nput);
+  let idx = g_tid * rspan + nput;
+  let got = atomicExchange(&rbag[idx], u64(0));
+  if got == u64(0) {
+    return vec3<u32>(0u, 0u, 0u);
+  }
+  let cur = atomicLoad(&worker[wf(g_tid, W_RLEN)]);
+  if cur > 0u { atomicSub(&worker[wf(g_tid, W_RLEN)], 1u); }
+  return vec3<u32>(u32(got), u32(got >> 32u), 1u);
+}
+
 fn pop_from(wid: u32, limit: u32) -> vec3<u32> {
-  let rspan = atomicLoad(&ctl[M_RSPAN]);
+  let rspan = g_rspan;
   let base = wid * rspan;
   let start = atomicAdd(&worker[wf(g_tid, W_SIDX)], 1u);
   let n = min(limit, rspan);
   for (var k = 0u; k < n; k++) {
     let idx = base + ((start + k) % rspan);
-    let raw = atomicLoad(&rbag[idx]);
-    if raw == u64(0) {
-      continue;
-    }
     let got = atomicExchange(&rbag[idx], u64(0));
-    if got == u64(0) {
-      continue;
-    }
-    let lo = u32(got);
-    let hi = u32(got >> 32u);
+    if got == u64(0) { continue; }
     let cur = atomicLoad(&worker[wf(wid, W_RLEN)]);
-    if cur > 0u {
-      atomicSub(&worker[wf(wid, W_RLEN)], 1u);
-    }
-    return vec3<u32>(lo, hi, 1u);
+    if cur > 0u { atomicSub(&worker[wf(wid, W_RLEN)], 1u); }
+    return vec3<u32>(u32(got), u32(got >> 32u), 1u);
   }
   return vec3<u32>(0u, 0u, 0u);
 }
 
 fn try_emit_on(wid: u32, a: u32, b: u32) -> bool {
-  let rspan = atomicLoad(&ctl[M_RSPAN]);
-  let base = wid * rspan;
-  var put = atomicLoad(&worker[wf(wid, W_SIDX)]);
-  for (var k = 0u; k < rspan; k++) {
-    let i = (put + k) % rspan;
-    let idx = base + i;
-    let old = atomicCompareExchangeWeak(&rbag[idx], u64(0), pack2(a, b));
-    if old.exchanged {
-      atomicStore(&worker[wf(wid, W_SIDX)], (i + 1u) % rspan);
-      atomicAdd(&worker[wf(wid, W_RLEN)], 1u);
-      return true;
-    }
+  let rspan = g_rspan;
+  // Stack push for the owner. Neighbours get a single CAS at their rput.
+  if wid == g_tid {
+    let i = atomicLoad(&worker[wf(wid, W_RPUT)]);
+    if i >= rspan { return false; }
+    atomicStore(&worker[wf(wid, W_RPUT)], i + 1u);
+    atomicStore(&rbag[wid * rspan + i], pack2(a, b));
+    atomicAdd(&worker[wf(wid, W_RLEN)], 1u);
+    return true;
+  }
+  let i = atomicLoad(&worker[wf(wid, W_RPUT)]);
+  if i >= rspan { return false; }
+  let idx = wid * rspan + (i % rspan);
+  let old = atomicCompareExchangeWeak(&rbag[idx], u64(0), pack2(a, b));
+  if old.exchanged {
+    atomicAdd(&worker[wf(wid, W_RLEN)], 1u);
+    return true;
   }
   return false;
 }
 
 fn emit_global(a: u32, b: u32) {
   if try_emit_on(g_tid, a, b) { return; }
-  let n = atomicLoad(&ctl[M_NTHREADS]);
+  let n = g_nthreads;
   for (var k = 1u; k < 8u; k++) {
     if k >= n { break; }
     let wid = (g_tid + k) % n;
@@ -240,16 +269,15 @@ fn pop_redex() -> vec3<u32> {
     ltop = ltop - 1u;
     return vec3<u32>(llo[ltop], lhi[ltop], 1u);
   }
-  let rspan = atomicLoad(&ctl[M_RSPAN]);
-  let own = pop_from(g_tid, rspan);
+  let own = pop_own();
   if own.z != 0u {
     return own;
   }
-  let n = atomicLoad(&ctl[M_NTHREADS]);
-  for (var k = 1u; k < 8u; k++) {
-    if k >= n { break; }
-    let sid = (g_tid + n - k) % n;
-    let st = pop_from(sid, 32u);
+  let n = g_nthreads;
+  // Idle lanes must not spray atomics: one neighbour, tiny window.
+  if n > 1u {
+    let sid = (g_tid + n - 1u) % n;
+    let st = pop_from(sid, 4u);
     if st.z != 0u {
       return st;
     }
@@ -276,12 +304,12 @@ fn enter(start: u32) -> u32 {
   for (var g = 0u; g < 1024u; g++) {
     if tag_of(p) != VAR { return p; }
     let idx = var_idx(p);
-    if idx >= atomicLoad(&ctl[M_VLEN]) { return p; }
-    let val = atomicExchange(&vars[idx], NONE);
+    if idx >= g_vlen { return p; }
+    let val = vxchg(idx, NONE);
     if val == NONE || val == 0u {
       return p;
     }
-    atomicStore(&vars[idx], 0u);
+    vst(idx, 0u);
     p = val;
   }
   return p;
@@ -300,21 +328,21 @@ fn link(aa: u32, bb: u32) {
     }
     b = enter(b);
     let idx = var_idx(a);
-    if idx >= atomicLoad(&ctl[M_VLEN]) {
+    if idx >= g_vlen {
       atomicStore(&ctl[M_OOM], 1u);
       return;
     }
-    let a_ = atomicExchange(&vars[idx], b);
+    let a_ = vxchg(idx, b);
     if a_ == NONE {
       return;
     }
-    atomicStore(&vars[idx], 0u);
+    vst(idx, 0u);
     a = a_;
   }
 }
 
 fn part_range(len: u32) -> vec2<u32> {
-  let n = atomicLoad(&ctl[M_NTHREADS]);
+  let n = g_nthreads;
   let span = max(len / n, 1u);
   let base = g_tid * span;
   if base >= len {
@@ -327,87 +355,50 @@ fn part_range(len: u32) -> vec2<u32> {
   return vec2<u32>(base, end);
 }
 
-fn rover_nodes(need: u32, already: u32) -> bool {
-  let nlen = atomicLoad(&ctl[M_NLEN]);
-  var got = already;
-  let tries = min(nlen, 8192u);
-  for (var t = 0u; t < tries; t++) {
-    var slot = atomicAdd(&ctl[M_NROVER], 1u) % nlen;
-    if slot == 0u { slot = 1u; }
-    // Claim exclusively. 1u is not a valid pair (fst tag VAR val 0).
-    let claim = atomicCompareExchangeWeak(&node[slot], u64(0), u64(1));
-    if !claim.exchanged { continue; }
-    nloc[got] = slot;
-    got = got + 1u;
-    if got >= need { return true; }
-  }
-  return false;
-}
-
 fn node_alloc(num: u32) -> bool {
   if num == 0u { return true; }
   if num > MAX_SLOTS { return false; }
-  let nlen = atomicLoad(&ctl[M_NLEN]);
+  let nlen = g_nlen;
   let rg = part_range(nlen);
-  let base = rg.x;
-  let end = rg.y;
-  let limit = max(end - base, 1u);
+  let base = max(rg.x, 1u);
+  let end = max(rg.y, base + 1u);
+  let limit = min(max(end - base, 1u) * 2u, 4096u);
   var got = 0u;
   for (var k = 0u; k < limit; k++) {
     nput = nput + 1u;
     if nput >= end || nput == 0u {
-      nput = max(base, 1u);
+      nput = base;
       nwrap = 1u;
     }
-    let claim = atomicCompareExchangeWeak(&node[nput], u64(0), u64(1));
-    if !claim.exchanged {
-      continue;
-    }
+    // Always CAS: rover used to steal other stripes and first-pass stores tore REFs.
+    if !ncas0(nput) { continue; }
     nloc[got] = nput;
     got = got + 1u;
     if got >= num { return true; }
   }
-  return rover_nodes(num, got);
+  return false;
 }
 
 fn vars_alloc(num: u32) -> bool {
   if num == 0u { return true; }
   if num > MAX_SLOTS { return false; }
-  let vlen = atomicLoad(&ctl[M_VLEN]);
+  let vlen = g_vlen;
   let rg = part_range(vlen);
-  let base = rg.x;
-  let end = rg.y;
-  let limit = max(end - base, 1u);
+  let base = max(rg.x, 1u);
+  let end = max(rg.y, base + 1u);
+  let limit = min(max(end - base, 1u) * 2u, 4096u);
   var got = 0u;
   for (var k = 0u; k < limit; k++) {
     vput = vput + 1u;
     if vput >= vlen || vput == 0u || vput >= end {
-      vput = max(base, 1u);
+      vput = base;
       vwrap = 1u;
     }
-    let claim = atomicCompareExchangeWeak(&vars[vput], 0u, NONE);
-    if !claim.exchanged {
-      continue;
-    }
+    if vput == 0u { continue; }
+    if !vcas(vput, 0u, NONE) { continue; }
     vloc[got] = vput;
     got = got + 1u;
     if got >= num { return true; }
-  }
-  return rover_vars(num, got);
-}
-
-fn rover_vars(need: u32, already: u32) -> bool {
-  let vlen = atomicLoad(&ctl[M_VLEN]);
-  var got = already;
-  let tries = min(vlen, 8192u);
-  for (var t = 0u; t < tries; t++) {
-    var slot = atomicAdd(&ctl[M_VROVER], 1u) % vlen;
-    if slot == 0u { slot = 1u; }
-    let claim = atomicCompareExchangeWeak(&vars[slot], 0u, NONE);
-    if !claim.exchanged { continue; }
-    vloc[got] = slot;
-    got = got + 1u;
-    if got >= need { return true; }
   }
   return false;
 }
@@ -443,7 +434,7 @@ fn interact_void() -> bool {
 fn interact_eras(a: u32, b: u32) -> bool {
   if !get_resources(0u, 0u) { return false; }
   let bi = val_of(b);
-  if bi >= atomicLoad(&ctl[M_NLEN]) || node_empty(bi) { return false; }
+  if bi >= g_nlen || node_empty(bi) { return false; }
   let bp = node_take(bi);
   link(a, bp.x);
   link(a, bp.y);
@@ -454,7 +445,7 @@ fn interact_anni(a: u32, b: u32) -> bool {
   if !get_resources(0u, 0u) { return false; }
   let ai = val_of(a);
   let bi = val_of(b);
-  let nlen = atomicLoad(&ctl[M_NLEN]);
+  let nlen = g_nlen;
   if ai >= nlen || bi >= nlen || node_empty(ai) || node_empty(bi) { return false; }
   let ap = node_take(ai);
   let bp = node_take(bi);
@@ -467,14 +458,14 @@ fn interact_comm(a: u32, b: u32) -> bool {
   if !get_resources(4u, 4u) { return false; }
   let ai = val_of(a);
   let bi = val_of(b);
-  let nlen = atomicLoad(&ctl[M_NLEN]);
+  let nlen = g_nlen;
   if ai >= nlen || bi >= nlen || node_empty(ai) || node_empty(bi) { return false; }
   let ap = node_take(ai);
   let bp = node_take(bi);
-  atomicStore(&vars[vloc[0]], NONE);
-  atomicStore(&vars[vloc[1]], NONE);
-  atomicStore(&vars[vloc[2]], NONE);
-  atomicStore(&vars[vloc[3]], NONE);
+  vst(vloc[0], NONE);
+  vst(vloc[1], NONE);
+  vst(vloc[2], NONE);
+  vst(vloc[3], NONE);
   node_store(nloc[0], vec2<u32>(mk_port(VAR, vloc[0]), mk_port(VAR, vloc[1])));
   node_store(nloc[1], vec2<u32>(mk_port(VAR, vloc[2]), mk_port(VAR, vloc[3])));
   node_store(nloc[2], vec2<u32>(mk_port(VAR, vloc[0]), mk_port(VAR, vloc[2])));
@@ -678,7 +669,7 @@ fn operate(a: u32, b: u32) -> u32 {
 fn interact_oper(a: u32, b: u32) -> bool {
   if !get_resources(1u, 0u) { return false; }
   let bi = val_of(b);
-  if bi >= atomicLoad(&ctl[M_NLEN]) || node_empty(bi) { return false; }
+  if bi >= g_nlen || node_empty(bi) { return false; }
   let av = val_of(a);
   let bp = node_take(bi);
   let b1 = bp.x;
@@ -696,7 +687,7 @@ fn interact_oper(a: u32, b: u32) -> bool {
 fn interact_swit(a: u32, b: u32) -> bool {
   if !get_resources(2u, 0u) { return false; }
   let bi = val_of(b);
-  if bi >= atomicLoad(&ctl[M_NLEN]) || node_empty(bi) { return false; }
+  if bi >= g_nlen || node_empty(bi) { return false; }
   let av = get_u24(val_of(a));
   let bp = node_take(bi);
   if av == 0u {
@@ -795,9 +786,12 @@ const WG: u32 = 64u;
 
 @compute @workgroup_size(64)
 fn evaluator(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let nthreads = atomicLoad(&ctl[M_NTHREADS]);
+  g_nthreads = atomicLoad(&ctl[M_NTHREADS]);
+  g_nlen = atomicLoad(&ctl[M_NLEN]);
+  g_vlen = atomicLoad(&ctl[M_VLEN]);
+  g_rspan = atomicLoad(&ctl[M_RSPAN]);
   g_tid = gid.x;
-  if g_tid >= nthreads { return; }
+  if g_tid >= g_nthreads { return; }
   nput = atomicLoad(&worker[wf(g_tid, W_NPUT)]);
   vput = atomicLoad(&worker[wf(g_tid, W_VPUT)]);
   nwrap = atomicLoad(&worker[wf(g_tid, W_NWRAP)]);
@@ -805,12 +799,19 @@ fn evaluator(@builtin(global_invocation_id) gid: vec3<u32>) {
   ltop = 0u;
   litrs = 0u;
   let max_steps = atomicLoad(&ctl[M_MAX]);
+  var misses = 0u;
   for (var s = 0u; s < max_steps; s++) {
     if atomicLoad(&ctl[M_OOM]) != 0u { break; }
     if atomicLoad(&ctl[M_ERR]) != 0u { break; }
     let rd = pop_redex();
-    if rd.z == 0u { break; }
-    // Failed interact re-emits; keep going (do not treat as idle).
+    if rd.z == 0u {
+      // Idle lanes used to spin for the full STEPS window and saturate atomics.
+      // After a short wait, leave so the busy lane is not fighting 63 stealers.
+      misses = misses + 1u;
+      if misses >= 32u { break; }
+      continue;
+    }
+    misses = 0u;
     interact_one(rd.x, rd.y);
   }
   flush_local();
@@ -821,5 +822,6 @@ fn evaluator(@builtin(global_invocation_id) gid: vec3<u32>) {
   atomicStore(&worker[wf(g_tid, W_VPUT)], vput);
   atomicStore(&worker[wf(g_tid, W_NWRAP)], nwrap);
   atomicStore(&worker[wf(g_tid, W_VWRAP)], vwrap);
-  atomicAdd(&ctl[M_RLEN], atomicLoad(&worker[wf(g_tid, W_RLEN)]) + ltop);
+  // Host sums worker W_RLEN + overflow. Do not touch M_RLEN (avoids a
+  // write_buffer submit every turn, which burned the 256-submit budget).
 }
