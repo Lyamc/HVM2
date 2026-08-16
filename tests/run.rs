@@ -62,6 +62,24 @@ fn test_file(path: &Path) {
       "{path:?}: CUDA output does not match rust output"
     );
   }
+
+  if cfg!(feature = "wgpu") && wgpu_small_enough(path) {
+    println!("  testing {path:?}, wgpu...");
+    let wgpu_output = execute_hvm(&["run-wgpu".as_ref(), path.as_os_str()], false).unwrap();
+    assert_eq!(
+      wgpu_output, rust_output,
+      "{path:?}: wgpu output does not match rust output"
+    );
+  }
+}
+
+fn wgpu_small_enough(path: &Path) -> bool {
+  let s = path.to_string_lossy();
+  s.contains("hello-world")
+    || s.contains("numerics")
+    || s.ends_with("list.hvm")
+    || s.ends_with("empty.hvm")
+    || s.contains("numeric-casts")
 }
 
 fn test_io_file(path: &Path) {
@@ -159,6 +177,7 @@ fn parse_output(output: &str) -> Result<String, String> {
       && !line.starts_with("- TIME:")
       && !line.starts_with("- MIPS:")
       && !line.starts_with("- LEAK:")
+      && !line.starts_with("- LANES:")
     {
       // TODO: include iteration count in snapshot once consistent
       lines.push(line.to_string())

@@ -17,6 +17,9 @@ TSPL = "0.0.13"
 clap = "4.5.2"
 highlight_error = "0.1.1"
 num_cpus = "1.0"
+bytemuck = { version = "1", optional = true }
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "30", optional = true }
 
 [build-dependencies]
 cc = "1.0"
@@ -34,6 +37,9 @@ default = []
 # Set HVM_SKIP_C / HVM_SKIP_CUDA to force the Rust-only build.
 c = []
 cuda = []
+# Optional WebGPU interpreter. Not auto-detected. Same .hvm books as `run`.
+#   cargo build --release --features wgpu
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dev-dependencies]
 insta = { version = "1.39.0", features = ["glob"] }

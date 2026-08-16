@@ -21,18 +21,8 @@ extern "C" {
   fn hvm_cu(book_buffer: *const u32);
 }
 
-fn default_threads(parallel: bool) -> u32 {
-  if let Ok(v) = env::var("HVM_THREADS") {
-    if let Ok(n) = v.parse::<u32>() {
-      return n.max(1).min(32);
-    }
-  }
-  if parallel {
-    (num_cpus::get_physical() as u32).clamp(1, 16)
-  } else {
-    // Lock-free steal; 8 is the sweet spot (16 oversubscribes). 1 still works via --threads 1.
-    (num_cpus::get_physical() as u32).clamp(1, 8)
-  }
+fn default_threads(_parallel: bool) -> u32 {
+  hvm::env_threads_or(hvm::default_tpc(num_cpus::get_physical()))
 }
 
 fn threads_arg() -> Arg {
@@ -40,7 +30,7 @@ fn threads_arg() -> Arg {
     .long("threads")
     .short('t')
     .value_parser(clap::value_parser!(u32))
-    .help("Worker threads. run-c: min(physical, 16). run: min(physical, 8) lock-free pool. Also HVM_THREADS.")
+    .help("Worker threads. Default is min(8, 2^floor(log2(physical cores))); cap 16 via --threads / HVM_THREADS.")
 }
 
 fn cli_threads(sub: &ArgMatches, parallel: bool) -> u32 {
@@ -77,6 +67,11 @@ fn main() {
           .action(ArgAction::SetTrue)
           .help("Run with IO enabled")))
     .subcommand(
+      Command::new("run-wgpu")
+        .alias("run-wg")
+        .about("Interprets a file (using WebGPU / wgpu). Same .hvm books as `run`; no Bend changes.")
+        .arg(Arg::new("file").required(true)))
+    .subcommand(
       Command::new("gen-c")
         .about("Compiles a file with IO (to standalone C)")
         .arg(Arg::new("file").required(true))
@@ -92,6 +87,10 @@ fn main() {
           .long("io")
           .action(ArgAction::SetTrue)
           .help("Generate with IO enabled")))
+    .subcommand(
+      Command::new("gen-rs")
+        .about("Compiles a file to standalone Rust (compiled interact_call; rustc)")
+        .arg(Arg::new("file").required(true)))
     .get_matches();
 
   match matches.subcommand() {
@@ -129,6 +128,15 @@ fn main() {
       }
       #[cfg(not(feature = "cuda"))]
       println!("CUDA runtime not available!\n If you've installed CUDA and nvcc after HVM, please reinstall HVM.");
+    }
+    Some(("run-wgpu", sub_matches)) => {
+      let file = sub_matches.get_one::<String>("file").expect("required");
+      let code = fs::read_to_string(file).expect("Unable to read file");
+      let book = ast::Book::parse(&code).unwrap_or_else(|er| panic!("{}",er)).build();
+      #[cfg(feature = "wgpu")]
+      ::hvm::run_wgpu::run(&book);
+      #[cfg(not(feature = "wgpu"))]
+      println!("WebGPU runtime not available!\nRebuild with: cargo build --release --features wgpu");
     }
     Some(("gen-c", sub_matches)) => {
       // Reads book from file
@@ -184,8 +192,15 @@ fn main() {
       let hvm_cu = hvm_cu.replace("//COMPILED_BOOK_BUF//", &bookb);
       let hvm_cu = hvm_cu.replace("#define WITHOUT_MAIN", "#define WITH_MAIN");
       let hvm_cu = format!("{hvm_cu}\n\n{}", include_str!("run.cu"));
+      let hvm_cu = hvm_cu.replace("#include \"hvm_os.h\"", include_str!("hvm_os.h"));
       let hvm_cu = hvm_cu.replace(r#"#include "hvm.cu""#, "");
       println!("{}", hvm_cu);
+    }
+    Some(("gen-rs", sub_matches)) => {
+      let file = sub_matches.get_one::<String>("file").expect("required");
+      let code = fs::read_to_string(file).expect("Unable to read file");
+      let book = ast::Book::parse(&code).unwrap_or_else(|er| panic!("{}",er)).build();
+      print!("{}", ::hvm::gen::generate_rs(&book));
     }
     _ => unreachable!(),
   }
@@ -210,7 +225,7 @@ pub fn run(book: &hvm::Book, threads: u32) {
   // Evaluates
   if threads <= 1 {
     let mut tm = hvm::TMem::new(0, 1);
-    tm.rbag.push_redex(boot);
+    tm.push_redex(&net, boot);
     tm.evaluator(&net, book);
   } else {
     hvm::TMem::evaluator_pool(&net, book, boot, threads);

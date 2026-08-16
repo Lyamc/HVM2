@@ -1,10 +1,9 @@
-use crate::ast;
 use crate::hvm;
 
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Target { CUDA, C }
+pub enum Target { CUDA, C, Rust }
 
 // Compiles a whole Book.
 pub fn compile_book(trg: Target, book: &hvm::Book) -> String {
@@ -16,19 +15,32 @@ pub fn compile_book(trg: Target, book: &hvm::Book) -> String {
     code.push_str(&format!("\n"));
   }
 
-  // Compiles interact_call
+  // Compiles interact_call dispatcher
   if trg == Target::CUDA {
-    code.push_str(&format!("__device__ "));
+    code.push_str("__device__ ");
   }
-  code.push_str(&format!("bool interact_call(Net *net, TM *tm, Port a, Port b) {{\n"));
-  code.push_str(&format!("  u32 fid = get_val(a) & 0xFFFFFFF;\n"));
-  code.push_str(&format!("  switch (fid) {{\n"));
-  for (fid, def) in book.defs.iter().enumerate() {
-    code.push_str(&format!("    case {}: return interact_call_{}(net, tm, a, b);\n", fid, &def.name.replace("/","_").replace(".","_").replace("-","_")));
+  if trg == Target::Rust {
+    code.push_str("fn interact_call_compiled(net: &GNet, tm: &mut TMem, a: Port, b: Port) -> bool {\n");
+    code.push_str("  match get_val(a) & 0xFFFFFFF {\n");
+    for (fid, def) in book.defs.iter().enumerate() {
+      let fun = sanitize_name(&def.name);
+      code.push_str(&format!("    {fid} => interact_call_{fun}(net, tm, a, b),\n"));
+    }
+    code.push_str("    _ => false,\n");
+    code.push_str("  }\n");
+    code.push_str("}\n");
+  } else {
+    code.push_str("bool interact_call(Net *net, TM *tm, Port a, Port b) {\n");
+    code.push_str("  u32 fid = get_val(a) & 0xFFFFFFF;\n");
+    code.push_str("  switch (fid) {\n");
+    for (fid, def) in book.defs.iter().enumerate() {
+      let fun = sanitize_name(&def.name);
+      code.push_str(&format!("    case {fid}: return interact_call_{fun}(net, tm, a, b);\n"));
+    }
+    code.push_str("    default: return false;\n");
+    code.push_str("  }\n");
+    code.push_str("}");
   }
-  code.push_str(&format!("    default: return false;\n"));
-  code.push_str(&format!("  }}\n"));
-  code.push_str(&format!("}}"));
 
   return code;
 }
@@ -36,40 +48,68 @@ pub fn compile_book(trg: Target, book: &hvm::Book) -> String {
 // Compiles a single Def.
 pub fn compile_def(trg: Target, code: &mut String, book: &hvm::Book, tab: usize, fid: hvm::Val) {
   let def = &book.defs[fid as usize];
-  let fun = &def.name.replace("/","_").replace(".","_").replace("-","_");
+  let fun = sanitize_name(&def.name);
 
   // Initializes context
   let neo = &mut 0;
   
   // Generates function
   if trg == Target::CUDA {
-    code.push_str(&format!("__device__ "));
+    code.push_str("__device__ ");
   }
-  code.push_str(&format!("{}bool interact_call_{}(Net *net, TM *tm, Port a, Port b) {{\n", indent(tab), fun));
+  if trg == Target::Rust {
+    code.push_str(&format!("{}fn interact_call_{}(net: &GNet, tm: &mut TMem, a: Port, mut b: Port) -> bool {{\n", indent(tab), fun));
+  } else {
+    code.push_str(&format!("{}bool interact_call_{}(Net *net, TM *tm, Port a, Port b) {{\n", indent(tab), fun));
+  }
   // Fast DUP-REF
   if def.safe {
     code.push_str(&format!("{}if (get_tag(b) == DUP) {{\n", indent(tab+1)));
     code.push_str(&format!("{}return interact_eras(net, tm, a, b);\n", indent(tab+2)));
     code.push_str(&format!("{}}}\n", indent(tab+1)));
   }
-  code.push_str(&format!("{}u32 vl = 0;\n", indent(tab+1)));
-  code.push_str(&format!("{}u32 nl = 0;\n", indent(tab+1)));
+  if trg == Target::Rust {
+    code.push_str(&format!("{}let mut vl: u32 = 0;\n", indent(tab+1)));
+    code.push_str(&format!("{}let mut nl: u32 = 0;\n", indent(tab+1)));
+  } else {
+    code.push_str(&format!("{}u32 vl = 0;\n", indent(tab+1)));
+    code.push_str(&format!("{}u32 nl = 0;\n", indent(tab+1)));
+  }
 
   // Allocs resources (using fast allocator)
   for i in 0 .. def.vars {
-    code.push_str(&format!("{}Val v{:x} = vars_alloc_1(net, tm, &vl);\n", indent(tab+1), i));
+    if trg == Target::Rust {
+      code.push_str(&format!("{}let v{:x} = vars_alloc_1(net, tm, &mut vl);\n", indent(tab+1), i));
+    } else {
+      code.push_str(&format!("{}Val v{:x} = vars_alloc_1(net, tm, &vl);\n", indent(tab+1), i));
+    }
   }
   for i in 0 .. def.node.len() {
-    code.push_str(&format!("{}Val n{:x} = node_alloc_1(net, tm, &nl);\n", indent(tab+1), i));
+    if trg == Target::Rust {
+      code.push_str(&format!("{}let n{:x} = node_alloc_1(net, tm, &mut nl);\n", indent(tab+1), i));
+    } else {
+      code.push_str(&format!("{}Val n{:x} = node_alloc_1(net, tm, &nl);\n", indent(tab+1), i));
+    }
   }
-  code.push_str(&format!("{}if (0", indent(tab+1)));
-  for i in 0 .. def.vars {
-    code.push_str(&format!(" || !v{:x}", i));
+  if trg == Target::Rust {
+    code.push_str(&format!("{}if false", indent(tab+1)));
+    for i in 0 .. def.vars {
+      code.push_str(&format!(" || v{:x} == 0", i));
+    }
+    for i in 0 .. def.node.len() {
+      code.push_str(&format!(" || n{:x} == 0", i));
+    }
+    code.push_str(" {\n");
+  } else {
+    code.push_str(&format!("{}if (0", indent(tab+1)));
+    for i in 0 .. def.vars {
+      code.push_str(&format!(" || !v{:x}", i));
+    }
+    for i in 0 .. def.node.len() {
+      code.push_str(&format!(" || !n{:x}", i));
+    }
+    code.push_str(") {\n");
   }
-  for i in 0 .. def.node.len() {
-    code.push_str(&format!(" || !n{:x}", i));
-  }
-  code.push_str(&format!(") {{\n"));
   code.push_str(&format!("{}return false;\n", indent(tab+2)));
   code.push_str(&format!("{}}}\n", indent(tab+1)));
   for i in 0 .. def.vars {
@@ -134,19 +174,19 @@ pub fn compile_link_fast(trg: Target, code: &mut String, book: &hvm::Book, neo: 
         let x1   = fresh(neo);
         let x2   = fresh(neo);
         let nu   = fresh(neo);
-        code.push_str(&format!("{}bool {} = 0;\n", indent(tab), &op));
-        code.push_str(&format!("{}Pair {} = 0;\n", indent(tab), &bv));
-        code.push_str(&format!("{}Port {} = NONE;\n", indent(tab), &nu));
-        code.push_str(&format!("{}Port {} = NONE;\n", indent(tab), &x1));
-        code.push_str(&format!("{}Port {} = NONE;\n", indent(tab), &x2));
+        code.push_str(&format!("{}{}\n", indent(tab), decl_bool(trg, &op)));
+        code.push_str(&format!("{}{}\n", indent(tab), decl_pair(trg, &bv)));
+        code.push_str(&format!("{}{}\n", indent(tab), decl_port(trg, &nu)));
+        code.push_str(&format!("{}{}\n", indent(tab), decl_port(trg, &x1)));
+        code.push_str(&format!("{}{}\n", indent(tab), decl_port(trg, &x2)));
         code.push_str(&format!("{}//fast switch\n", indent(tab)));
         code.push_str(&format!("{}if (get_tag({}) == CON) {{\n", indent(tab), b));
         code.push_str(&format!("{}{} = node_load(net, get_val({}));\n", indent(tab+1), &bv, b)); // recycled
         code.push_str(&format!("{}{} = enter(net,get_fst({}));\n", indent(tab+1), &nu, &bv));
         code.push_str(&format!("{}if (get_tag({}) == NUM) {{\n", indent(tab+1), &nu));
-        code.push_str(&format!("{}tm->itrs += 3;\n", indent(tab+2)));
-        code.push_str(&format!("{}vars_take(net, v{});\n", indent(tab+2), a2.get_val()));
-        code.push_str(&format!("{}{} = 1;\n", indent(tab+2), &op));
+        code.push_str(&format!("{}{} += 3;\n", indent(tab+2), tm_itrs(trg)));
+        code.push_str(&format!("{}vars_take(net, v{:x});\n", indent(tab+2), a2.get_val()));
+        code.push_str(&format!("{}{} = {};\n", indent(tab+2), &op, lit_true(trg)));
         code.push_str(&format!("{}if (get_u24(get_val({})) == 0) {{\n", indent(tab+2), &nu));
         code.push_str(&format!("{}node_take(net, get_val({}));\n", indent(tab+3), b));
         code.push_str(&format!("{}{} = get_snd({});\n", indent(tab+3), &x1, &bv));
@@ -163,8 +203,8 @@ pub fn compile_link_fast(trg: Target, code: &mut String, book: &hvm::Book, neo: 
         compile_link_fast(trg, code, book, neo, tab, def, a111, &x1);
         compile_link_fast(trg, code, book, neo, tab, def, a112, &x2);
         code.push_str(&format!("{}if (!{}) {{\n", indent(tab), &op));
-        code.push_str(&format!("{}node_create(net, n{:x}, new_pair(new_port(SWI,n{}),new_port(VAR,v{})));\n", indent(tab+1), a.get_val(), a1.get_val(), a2.get_val()));
-        code.push_str(&format!("{}node_create(net, n{:x}, new_pair(new_port(CON,n{}),new_port(VAR,v{})));\n", indent(tab+1), a1.get_val(), a11.get_val(), a12.get_val()));
+        code.push_str(&format!("{}node_create(net, n{:x}, new_pair(new_port(SWI,n{:x}),new_port(VAR,v{:x})));\n", indent(tab+1), a.get_val(), a1.get_val(), a2.get_val()));
+        code.push_str(&format!("{}node_create(net, n{:x}, new_pair(new_port(CON,n{:x}),new_port(VAR,v{:x})));\n", indent(tab+1), a1.get_val(), a11.get_val(), a12.get_val()));
         code.push_str(&format!("{}node_create(net, n{:x}, new_pair({},{}));\n", indent(tab+1), a11.get_val(), &x1, &x2));
         link_or_store(trg, code, book, neo, tab+1, def, &format!("new_port(CON, n{:x})", a.get_val()), b);
         code.push_str(&format!("{}}}\n", indent(tab)));
@@ -184,12 +224,12 @@ pub fn compile_link_fast(trg: Target, code: &mut String, book: &hvm::Book, neo: 
     let op = fresh(neo);
     let x1 = compile_node(trg, code, book, neo, tab, def, a1);
     let x2 = fresh(neo);
-    code.push_str(&format!("{}bool {} = 0;\n", indent(tab), &op));
-    code.push_str(&format!("{}Port {} = NONE;\n", indent(tab), &x2));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_bool(trg, &op)));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_port(trg, &x2)));
     code.push_str(&format!("{}// fast oper\n", indent(tab)));
     code.push_str(&format!("{}if (get_tag({}) == NUM && get_tag({}) == NUM) {{\n", indent(tab), b, &x1));
-    code.push_str(&format!("{}tm->itrs += 1;\n", indent(tab+1)));
-    code.push_str(&format!("{}{} = 1;\n", indent(tab+1), &op));
+    code.push_str(&format!("{}{} += 1;\n", indent(tab+1), tm_itrs(trg)));
+    code.push_str(&format!("{}{} = {};\n", indent(tab+1), &op, lit_true(trg)));
     code.push_str(&format!("{}{} = new_port(NUM, operate(get_val({}), get_val({})));\n", indent(tab+1), &x2, b, &x1));
     code.push_str(&format!("{}}}\n", indent(tab)));
     compile_link_fast(trg, code, book, neo, tab, def, a2, &x2);
@@ -212,13 +252,13 @@ pub fn compile_link_fast(trg: Target, code: &mut String, book: &hvm::Book, neo: 
     let op = fresh(neo);
     let x1 = fresh(neo);
     let x2 = fresh(neo);
-    code.push_str(&format!("{}bool {} = 0;\n", indent(tab), &op));
-    code.push_str(&format!("{}Port {} = NONE;\n", indent(tab), &x1));
-    code.push_str(&format!("{}Port {} = NONE;\n", indent(tab), &x2));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_bool(trg, &op)));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_port(trg, &x1)));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_port(trg, &x2)));
     code.push_str(&format!("{}// fast copy\n", indent(tab)));
     code.push_str(&format!("{}if (get_tag({}) == NUM) {{\n", indent(tab), b));
-    code.push_str(&format!("{}tm->itrs += 1;\n", indent(tab+1)));
-    code.push_str(&format!("{}{} = 1;\n", indent(tab+1), &op));
+    code.push_str(&format!("{}{} += 1;\n", indent(tab+1), tm_itrs(trg)));
+    code.push_str(&format!("{}{} = {};\n", indent(tab+1), &op, lit_true(trg)));
     code.push_str(&format!("{}{} = {};\n", indent(tab+1), &x1, b));
     code.push_str(&format!("{}{} = {};\n", indent(tab+1), &x2, b));
     code.push_str(&format!("{}}}\n", indent(tab)));
@@ -243,15 +283,15 @@ pub fn compile_link_fast(trg: Target, code: &mut String, book: &hvm::Book, neo: 
     let bv = fresh(neo);
     let x1 = fresh(neo);
     let x2 = fresh(neo);
-    code.push_str(&format!("{}bool {} = 0;\n", indent(tab), &op));
-    code.push_str(&format!("{}Pair {} = 0;\n", indent(tab), &bv));
-    code.push_str(&format!("{}Port {} = NONE;\n", indent(tab), &x1));
-    code.push_str(&format!("{}Port {} = NONE;\n", indent(tab), &x2));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_bool(trg, &op)));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_pair(trg, &bv)));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_port(trg, &x1)));
+    code.push_str(&format!("{}{}\n", indent(tab), decl_port(trg, &x2)));
     code.push_str(&format!("{}// fast anni\n", indent(tab)));
-    code.push_str(&format!("{}if (get_tag({}) == CON && node_load(net, get_val({})) != 0) {{\n", indent(tab), b, b));
+    code.push_str(&format!("{}if (get_tag({}) == CON && {}) {{\n", indent(tab), b, node_nz(trg, b)));
     //code.push_str(&format!("{}atomic_fetch_add(&FAST, 1);\n", indent(tab+1)));
-    code.push_str(&format!("{}tm->itrs += 1;\n", indent(tab+1)));
-    code.push_str(&format!("{}{} = 1;\n", indent(tab+1), &op));
+    code.push_str(&format!("{}{} += 1;\n", indent(tab+1), tm_itrs(trg)));
+    code.push_str(&format!("{}{} = {};\n", indent(tab+1), &op, lit_true(trg)));
     code.push_str(&format!("{}{} = node_take(net, get_val({}));\n", indent(tab+1), &bv, b));
     code.push_str(&format!("{}{} = get_fst({});\n", indent(tab+1), x1, &bv));
     code.push_str(&format!("{}{} = get_snd({});\n", indent(tab+1), x2, &bv));
@@ -279,7 +319,7 @@ pub fn compile_link_fast(trg: Target, code: &mut String, book: &hvm::Book, neo: 
   if trg != Target::CUDA && (a.get_tag() == hvm::NUM || a.get_tag() == hvm::ERA) {
     code.push_str(&format!("{}// fast void\n", indent(tab)));
     code.push_str(&format!("{}if (get_tag({}) == ERA || get_tag({}) == NUM) {{\n", indent(tab), b, b));
-    code.push_str(&format!("{}tm->itrs += 1;\n", indent(tab+1)));
+    code.push_str(&format!("{}{} += 1;\n", indent(tab+1), tm_itrs(trg)));
     code.push_str(&format!("{}}} else {{\n", indent(tab)));
     compile_link_slow(trg, code, book, neo, tab+1, def, a, b);
     code.push_str(&format!("{}}}\n", indent(tab)));
@@ -323,6 +363,50 @@ pub fn compile_node(trg: Target, code: &mut String, book: &hvm::Book, neo: &mut 
 //fn compile_atom(trg: Target, port: hvm::Port) -> String {
   //return format!("new_port({},0x{:08x})/*atom*/", compile_tag(trg, port.get_tag()), port.get_val());
 //}
+
+fn sanitize_name(name: &str) -> String {
+  name.replace("/", "_").replace(".", "_").replace("-", "_")
+}
+
+fn tm_itrs(trg: Target) -> &'static str {
+  if trg == Target::Rust { "tm.itrs" } else { "tm->itrs" }
+}
+
+fn lit_true(trg: Target) -> &'static str {
+  if trg == Target::Rust { "true" } else { "1" }
+}
+
+fn decl_bool(trg: Target, name: &str) -> String {
+  if trg == Target::Rust {
+    format!("let mut {name}: bool = false;")
+  } else {
+    format!("bool {name} = 0;")
+  }
+}
+
+fn decl_pair(trg: Target, name: &str) -> String {
+  if trg == Target::Rust {
+    format!("let mut {name}: Pair = Pair(0);")
+  } else {
+    format!("Pair {name} = 0;")
+  }
+}
+
+fn decl_port(trg: Target, name: &str) -> String {
+  if trg == Target::Rust {
+    format!("let mut {name}: Port = NONE;")
+  } else {
+    format!("Port {name} = NONE;")
+  }
+}
+
+fn node_nz(trg: Target, b: &str) -> String {
+  if trg == Target::Rust {
+    format!("node_load(net, get_val({b})).0 != 0")
+  } else {
+    format!("node_load(net, get_val({b})) != 0")
+  }
+}
 
 // Compiles a tag.
 pub fn compile_tag(trg: Target, tag: hvm::Tag) -> &'static str {

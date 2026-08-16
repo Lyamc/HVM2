@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::mem;
 
 // Runtime
@@ -16,6 +16,7 @@ pub type Rule = u8;  // Rule ::= 8-bit (fits a u8)
 pub struct Port(pub Val);
 
 // Pair
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Pair(pub u64);
 
 // Atomics
@@ -79,11 +80,35 @@ pub const FP_SHR : Tag = 0x16;
 pub const FREE : Port = Port(0x0);
 pub const ROOT : Port = Port(0xFFFFFFF8);
 pub const NONE : Port = Port(0xFFFFFFFF);
+/// Same cap as C `TPC_L2` (max 16 workers).
+pub const MAX_TPC: u32 = 16;
+/// Measured sweet spot on this class of CPU; `HVM_THREADS` can still go to `MAX_TPC`.
+pub const SWEET_TPC: u32 = 8;
+/// C `HLEN`: local high-priority redex stack.
+pub const HLEN: usize = 1 << 16;
+/// Low-priority steal-bag slots per worker (C uses `1<<24`; that bag is mostly idle).
+pub const RLEN: usize = 1 << 20;
 
-// RBag
-pub struct RBag {
-  pub lo: Vec<Pair>,
-  pub hi: Vec<Pair>,
+/// `2^floor(log2(physical))` capped at `MAX_TPC` — same rule as `hvm gen-c`.
+pub fn tpc_from_physical(physical: usize) -> u32 {
+  let cores = physical.max(1) as u32;
+  let log = (u32::BITS - 1 - cores.leading_zeros()).min(4);
+  1u32 << log
+}
+
+/// Default live workers: `min(SWEET_TPC, 2^floor(log2(physical)))`.
+pub fn default_tpc(physical: usize) -> u32 {
+  tpc_from_physical(physical).min(SWEET_TPC)
+}
+
+/// `HVM_THREADS` if set, otherwise `default`.
+pub fn env_threads_or(default: u32) -> u32 {
+  if let Ok(v) = std::env::var("HVM_THREADS") {
+    if let Ok(n) = v.parse::<u32>() {
+      return n.max(1).min(MAX_TPC);
+    }
+  }
+  default.max(1).min(MAX_TPC)
 }
 
 // Global Net
@@ -105,15 +130,14 @@ pub struct TMem {
   pub tids: u32, // thread count
   pub tick: u32, // tick counter
   pub itrs: u32, // interaction count
-  pub nput: usize, // next node allocation index
+  pub nput: usize, // next node allocation index (C-style offset in partition)
   pub vput: usize, // next vars allocation index
   pub rput: usize, // next steal-bag push index
+  pub hput: usize, // next local hbag push index
   pub sidx: usize, // steal scan index
-  pub nwrap: bool,
-  pub vwrap: bool,
   pub nloc: Vec<usize>, // allocated node locations
   pub vloc: Vec<usize>, // allocated vars locations
-  pub rbag: RBag, // local high-priority redex bag
+  pub hbag: Box<[Pair]>, // local high-priority stack (C `hbag_buf[HLEN]`)
 }
 
 // Top-Level Definition
@@ -425,39 +449,7 @@ impl Numb {
   }
 }
 
-impl RBag {
-  pub fn new() -> Self {
-    RBag {
-      lo: Vec::new(),
-      hi: Vec::new(),
-    }
-  }
 
-  pub fn push_redex(&mut self, redex: Pair) {
-    let rule = Port::get_rule(redex.get_fst(), redex.get_snd());
-    if Port::is_high_priority(rule) {
-      self.hi.push(redex);
-    } else {
-      self.lo.push(redex);
-    }
-  }
-
-  pub fn pop_redex(&mut self) -> Option<Pair> {
-    if !self.hi.is_empty() {
-      self.hi.pop()
-    } else {
-      self.lo.pop()
-    }
-  }
-
-  pub fn len(&self) -> usize {
-    self.lo.len() + self.hi.len()
-  }
-
-  pub fn has_highs(&self) -> bool {
-    !self.hi.is_empty()
-  }
-}
 
 impl<'a> GNet<'a> {
   pub fn new(nlen: usize, vlen: usize) -> Self {
@@ -466,20 +458,27 @@ impl<'a> GNet<'a> {
 
   pub fn with_workers(nlen: usize, vlen: usize, nthreads: u32) -> Self {
     let nthreads = nthreads.max(1);
-    let rspan = if nthreads > 1 { 1 << 18 } else { 0 };
+    // Always keep a C-style low-pri stripe. 1-thread used to dump everything into
+    // the 64K hbag, which overflowed and livelocked on sort.
+    let rspan = RLEN;
     let rlen = rspan * nthreads as usize;
     let nlay = Layout::array::<APair>(nlen).unwrap();
     let vlay = Layout::array::<APort>(vlen).unwrap();
     let rlay = Layout::array::<APair>(rlen.max(1)).unwrap();
-    let nptr = unsafe { alloc(nlay) as *mut APair };
-    let vptr = unsafe { alloc(vlay) as *mut APort };
-    let rptr = unsafe { alloc(rlay) as *mut APair };
+    let nptr = unsafe { alloc_zeroed(nlay) as *mut APair };
+    let vptr = unsafe { alloc_zeroed(vlay) as *mut APort };
+    let rptr = unsafe { alloc_zeroed(rlay) as *mut APair };
+    if nptr.is_null() || vptr.is_null() || rptr.is_null() {
+      panic!(
+        "HVM: out of memory allocating net buffers (nodes={} vars={} rbag={} bytes)",
+        nlen * mem::size_of::<APair>(),
+        vlen * mem::size_of::<APort>(),
+        rlen.max(1) * mem::size_of::<APair>()
+      );
+    }
     let node = unsafe { std::slice::from_raw_parts_mut(nptr, nlen) };
     let vars = unsafe { std::slice::from_raw_parts_mut(vptr, vlen) };
     let rbag = unsafe { std::slice::from_raw_parts_mut(rptr, rlen.max(1)) };
-    for slot in rbag.iter_mut() {
-      slot.0 = AtomicU64::new(0);
-    }
     GNet {
       nlen,
       vlen,
@@ -493,36 +492,45 @@ impl<'a> GNet<'a> {
     }
   }
 
+  #[inline(always)]
   pub fn node_create(&self, loc: usize, val: Pair) {
-    self.node[loc].0.store(val.0, Ordering::Relaxed);
+    unsafe { self.node.get_unchecked(loc).0.store(val.0, Ordering::Relaxed) }
   }
 
+  #[inline(always)]
   pub fn vars_create(&self, var: usize, val: Port) {
-    self.vars[var].0.store(val.0, Ordering::Relaxed);
+    unsafe { self.vars.get_unchecked(var).0.store(val.0, Ordering::Relaxed) }
   }
 
+  /// Relaxed load — same as C `Pair elem = net->node_buf[lc]` (no CAS).
+  #[inline(always)]
   pub fn node_load(&self, loc: usize) -> Pair {
-    Pair(self.node[loc].0.load(Ordering::Relaxed))
+    unsafe { Pair(self.node.get_unchecked(loc).0.load(Ordering::Relaxed)) }
   }
 
+  #[inline(always)]
   pub fn vars_load(&self, var: usize) -> Port {
-    Port(self.vars[var].0.load(Ordering::Relaxed) as u32)
+    unsafe { Port(self.vars.get_unchecked(var).0.load(Ordering::Relaxed) as u32) }
   }
 
+  #[inline(always)]
   pub fn node_store(&self, loc: usize, val: Pair) {
-    self.node[loc].0.store(val.0, Ordering::Relaxed);
+    unsafe { self.node.get_unchecked(loc).0.store(val.0, Ordering::Relaxed) }
   }
 
+  #[inline(always)]
   pub fn vars_store(&self, var: usize, val: Port) {
-    self.vars[var].0.store(val.0, Ordering::Relaxed);
+    unsafe { self.vars.get_unchecked(var).0.store(val.0, Ordering::Relaxed) }
   }
 
+  #[inline(always)]
   pub fn node_exchange(&self, loc: usize, val: Pair) -> Pair {
-    Pair(self.node[loc].0.swap(val.0, Ordering::Relaxed))
+    unsafe { Pair(self.node.get_unchecked(loc).0.swap(val.0, Ordering::Relaxed)) }
   }
 
+  #[inline(always)]
   pub fn vars_exchange(&self, var: usize, val: Port) -> Port {
-    Port(self.vars[var].0.swap(val.0, Ordering::Relaxed) as u32)
+    unsafe { Port(self.vars.get_unchecked(var).0.swap(val.0, Ordering::Relaxed) as u32) }
   }
 
   pub fn node_take(&self, loc: usize) -> Pair {
@@ -585,45 +593,58 @@ impl TMem {
       tids,
       tick: 0,
       itrs: 0,
-      nput: 0,
-      vput: 0,
+      nput: 1,
+      vput: 1,
       rput: 0,
+      hput: 0,
       sidx: 0,
-      nwrap: false,
-      vwrap: false,
       nloc: vec![0; 0xFFF], // FIXME: move to a constant
       vloc: vec![0; 0xFFF],
-      rbag: RBag::new(),
+      hbag: vec![Pair(0); HLEN].into_boxed_slice(),
     }
   }
 
-  fn alloc_range(&self, len: usize) -> (usize, usize) {
-    if self.tids <= 1 {
-      return (0, len);
+  /// Always `LEN/MAX_TPC`, like C's compile-time TPC stripe — even if fewer threads are live.
+  #[inline(always)]
+  fn partition_span(len: usize, _tids: u32) -> usize {
+    (len / MAX_TPC as usize).max(1)
+  }
+
+  /// C: `tid*(LEN/TPC) + (nput % (LEN/TPC))`.
+  #[inline(always)]
+  fn next_lc(tid: u32, put: &mut usize, len: usize, tids: u32) -> usize {
+    let span = Self::partition_span(len, tids);
+    let base = tid as usize * span;
+    let lc = base + (*put % span);
+    *put = put.wrapping_add(1);
+    lc
+  }
+
+  /// C `lc > 0 && elem == 0`. Never reuse `ROOT` (`0x1FFFFFFE`) or the last slot.
+  #[inline(always)]
+  fn var_is_free(net: &GNet, lc: usize) -> bool {
+    if lc == 0 || lc >= ROOT.get_val() as usize || lc >= net.vlen {
+      return false;
     }
-    let span = len / self.tids as usize;
-    let base = self.tid as usize * span;
-    let end = if self.tid + 1 == self.tids { len } else { base + span };
-    (base, end)
+    net.vars_load(lc).0 == 0
+  }
+
+  #[inline(always)]
+  fn node_is_free(net: &GNet, lc: usize) -> bool {
+    lc > 0 && lc < net.nlen && net.node_load(lc).0 == 0
   }
 
   pub fn node_alloc(&mut self, net: &GNet, num: usize) -> usize {
     let mut got = 0;
-    let (base, end) = self.alloc_range(net.nlen);
-    let limit = (end - base).max(1);
+    let limit = Self::partition_span(net.nlen, self.tids);
     for _ in 0..limit {
-      self.nput += 1;
-      if self.nput >= end || self.nput == 0 {
-        self.nput = base.max(1);
-        self.nwrap = true;
-      }
-      if self.nwrap && !net.is_node_free(self.nput) {
-        continue;
-      }
-      self.nloc[got] = self.nput;
-      got += 1;
-      if got >= num {
-        break;
+      let lc = Self::next_lc(self.tid, &mut self.nput, net.nlen, self.tids);
+      if Self::node_is_free(net, lc) {
+        self.nloc[got] = lc;
+        got += 1;
+        if got >= num {
+          break;
+        }
       }
     }
     got
@@ -631,44 +652,90 @@ impl TMem {
 
   pub fn vars_alloc(&mut self, net: &GNet, num: usize) -> usize {
     let mut got = 0;
-    let (base, end) = self.alloc_range(net.vlen);
-    let limit = (end - base).max(1);
+    let limit = Self::partition_span(net.vlen, self.tids);
     for _ in 0..limit {
-      self.vput += 1;
-      if self.vput >= end || self.vput == 0 {
-        self.vput = base.max(1);
-        self.vwrap = true;
-      }
-      if self.vwrap && !net.is_vars_free(self.vput) {
-        continue;
-      }
-      self.vloc[got] = self.vput;
-      got += 1;
-      if got >= num {
-        break;
+      let lc = Self::next_lc(self.tid, &mut self.vput, net.vlen, self.tids);
+      if Self::var_is_free(net, lc) {
+        self.vloc[got] = lc;
+        got += 1;
+        if got >= num {
+          break;
+        }
       }
     }
     got
   }
 
-  fn emit(&mut self, net: &GNet, redex: Pair) {
-    let rule = Port::get_rule(redex.get_fst(), redex.get_snd());
-    if self.tids <= 1 || net.rspan == 0 || Port::is_high_priority(rule) {
-      self.rbag.push_redex(redex);
-      return;
+  /// One-slot allocator used by compiled `interact_call` (same role as C `node_alloc_1`).
+  #[inline(always)]
+  pub fn node_alloc_1(&mut self, net: &GNet, lps: &mut u32) -> usize {
+    let limit = Self::partition_span(net.nlen, self.tids);
+    for _ in 0..limit {
+      *lps += 1;
+      let lc = Self::next_lc(self.tid, &mut self.nput, net.nlen, self.tids);
+      if Self::node_is_free(net, lc) {
+        return lc;
+      }
     }
-    let base = self.tid as usize * net.rspan;
-    if self.rput + 1 >= net.rspan {
-      self.rbag.push_redex(redex);
-      return;
-    }
-    let idx = base + self.rput;
-    self.rput += 1;
-    net.rbag[idx].0.store(redex.0, Ordering::Relaxed);
+    0
   }
 
-  fn pop_local(&mut self) -> Option<Pair> {
-    self.rbag.pop_redex()
+  /// One-slot allocator used by compiled `interact_call` (same role as C `vars_alloc_1`).
+  #[inline(always)]
+  pub fn vars_alloc_1(&mut self, net: &GNet, lps: &mut u32) -> usize {
+    let limit = Self::partition_span(net.vlen, self.tids);
+    for _ in 0..limit {
+      *lps += 1;
+      let lc = Self::next_lc(self.tid, &mut self.vput, net.vlen, self.tids);
+      if Self::var_is_free(net, lc) {
+        return lc;
+      }
+    }
+    0
+  }
+
+  #[inline(always)]
+  fn push_hbag(&mut self, redex: Pair) {
+    if self.hput < HLEN {
+      self.hbag[self.hput] = redex;
+      self.hput += 1;
+    }
+  }
+
+  /// C `push_redex`: high-pri → local hbag; low-pri → this worker's steal stripe.
+  #[inline(always)]
+  pub fn push_redex(&mut self, net: &GNet, redex: Pair) {
+    let rule = Port::get_rule(redex.get_fst(), redex.get_snd());
+    if net.rspan == 0 || Port::is_high_priority(rule) || self.rput + 1 >= net.rspan {
+      self.push_hbag(redex);
+      return;
+    }
+    let idx = self.tid as usize * net.rspan + self.rput;
+    self.rput += 1;
+    unsafe { net.rbag.get_unchecked(idx).0.store(redex.0, Ordering::Relaxed) }
+  }
+
+  #[inline(always)]
+  fn emit(&mut self, net: &GNet, redex: Pair) {
+    self.push_redex(net, redex);
+  }
+
+  /// C `pop_redex`: hbag then own steal stripe. Does not steal from others.
+  #[inline(always)]
+  fn pop_redex(&mut self, net: &GNet) -> Option<Pair> {
+    if self.hput > 0 {
+      self.hput -= 1;
+      return Some(self.hbag[self.hput]);
+    }
+    if net.rspan > 0 && self.rput > 0 {
+      self.rput -= 1;
+      let idx = self.tid as usize * net.rspan + self.rput;
+      let got = unsafe { net.rbag.get_unchecked(idx).0.swap(0, Ordering::Relaxed) };
+      if got != 0 {
+        return Some(Pair(got));
+      }
+    }
+    None
   }
 
   fn steal(&mut self, net: &GNet) -> Option<Pair> {
@@ -676,19 +743,31 @@ impl TMem {
       return None;
     }
     let n = net.nthreads as usize;
-    let sid = (self.tid as usize + n - 1) % n;
-    let base = sid * net.rspan;
-    let idx = base + (self.sidx % net.rspan);
-    self.sidx += 1;
-    if self.sidx >= net.rspan {
-      self.sidx = 0;
+    const PROBE: usize = 128;
+    // Previous worker, then the one before that. Short window, then yield.
+    for voff in [1usize, 2] {
+      let sid = (self.tid as usize + n - voff) % n;
+      let base = sid * net.rspan;
+      for _ in 0..PROBE {
+        if self.sidx >= net.rspan {
+          self.sidx = 0;
+          break;
+        }
+        let idx = base + self.sidx;
+        self.sidx += 1;
+        let got = unsafe { net.rbag.get_unchecked(idx).0.swap(0, Ordering::Relaxed) };
+        if got != 0 {
+          return Some(Pair(got));
+        }
+      }
     }
-    let got = net.rbag[idx].0.swap(0, Ordering::Relaxed);
-    if got == 0 {
-      None
-    } else {
-      Some(Pair(got))
-    }
+    self.sidx = 0;
+    None
+  }
+
+  #[inline(always)]
+  fn has_work(&self) -> bool {
+    self.hput > 0 || self.rput > 0
   }
 
   pub fn get_resources(&mut self, net: &GNet, _need_rbag: usize, need_node: usize, need_vars: usize) -> bool {
@@ -959,27 +1038,10 @@ impl TMem {
     true
   }
 
-  // Pops a local redex and performs a single interaction.
-  fn take_redex(&mut self, net: &GNet) -> Option<Pair> {
-    if let Some(redex) = self.rbag.pop_redex() {
-      return Some(redex);
-    }
-    if self.tids > 1 && net.rspan > 0 && self.rput > 0 {
-      self.rput -= 1;
-      let idx = self.tid as usize * net.rspan + self.rput;
-      let got = net.rbag[idx].0.swap(0, Ordering::Relaxed);
-      if got != 0 {
-        return Some(Pair(got));
-      }
-    }
-    self.steal(net)
-  }
-
   pub fn interact(&mut self, net: &GNet, book: &Book) -> bool {
-    // Pops a redex.
-    let redex = match self.take_redex(net) {
+    let redex = match self.pop_redex(net) {
       Some(redex) => redex,
-      None => return true, // If there is no redex, stop
+      None => return true,
     };
 
     // Gets redex ports A and B.
@@ -1001,7 +1063,7 @@ impl TMem {
 
     let success = match rule {
       LINK => self.interact_link(net, a, b),
-      CALL => self.interact_call(net, a, b, book),
+      CALL => compiled_interact_call(self, net, a, b, book),
       VOID => self.interact_void(net, a, b),
       ERAS => self.interact_eras(net, a, b),
       ANNI => self.interact_anni(net, a, b),
@@ -1033,8 +1095,7 @@ impl TMem {
     //let mut max_nlen = 0;
     //let mut max_vlen = 0;
 
-    // Performs some interactions
-    while self.rbag.len() > 0 {
+    while self.has_work() {
       self.interact(net, book);
 
       // DEBUG:
@@ -1068,34 +1129,38 @@ impl TMem {
     self.itrs = 0;
   }
 
-  /// Lock-free worker pool: partitioned alloc + atomic steal bags (same shape as hvm.c).
+  /// Lock-free worker pool: partitioned alloc + steal bags (same loop shape as `hvm.c`).
   pub fn evaluator_pool(net: &GNet, book: &Book, boot: Pair, nthreads: u32) {
     let n = nthreads.max(1);
     if net.rspan > 0 {
       net.rbag[0].0.store(boot.0, Ordering::Relaxed);
     }
-    net.idle.store(n.saturating_sub(1), Ordering::Relaxed);
+    // C `sync_threads()` then idle==TPC means halt. Boot lives in bag[0] (stolen, not local).
+    net.idle.store(n, Ordering::Relaxed);
+    let start = std::sync::Barrier::new(n as usize);
 
     std::thread::scope(|scope| {
       for tid in 0..n {
+        let start = &start;
         scope.spawn(move || {
           let mut tm = TMem::new(tid, n);
-          let (nbase, _) = tm.alloc_range(net.nlen);
-          let (vbase, _) = tm.alloc_range(net.vlen);
-          tm.nput = nbase;
-          tm.vput = vbase;
-          let mut busy = tid == 0;
+          start.wait();
+          let mut busy = false;
           let mut tick = 0u32;
           loop {
             tick = tick.wrapping_add(1);
-            let had = tm.take_redex(net);
-            if let Some(redex) = had {
+            if tm.has_work() {
               if !busy {
                 net.idle.fetch_sub(1, Ordering::Relaxed);
                 busy = true;
               }
-              tm.rbag.push_redex(redex);
               tm.interact(net, book);
+            } else if let Some(redex) = tm.steal(net) {
+              if !busy {
+                net.idle.fetch_sub(1, Ordering::Relaxed);
+                busy = true;
+              }
+              tm.push_redex(net, redex);
             } else {
               if busy {
                 net.idle.fetch_add(1, Ordering::Relaxed);
@@ -1112,6 +1177,12 @@ impl TMem {
       }
     });
   }
+}
+
+/// Interpreted CALL. `hvm gen-rs` rewrites this body to the compiled dispatcher.
+#[inline(always)]
+pub fn compiled_interact_call(tm: &mut TMem, net: &GNet, a: Port, b: Port, book: &Book) -> bool {
+  tm.interact_call(net, a, b, book)
 }
 
 // Serialization
@@ -1187,23 +1258,6 @@ impl Port {
 impl Pair {
   pub fn show(&self) -> String {
     format!("{} ~ {}", self.get_fst().show(), self.get_snd().show())
-  }
-}
-
-impl RBag {
-  pub fn show(&self) -> String {
-    let mut s = String::new();
-    s.push_str("RBAG | FST-TREE     | SND-TREE    \n");
-    s.push_str("---- | ------------ | ------------\n");
-    for (i, pair) in self.hi.iter().enumerate() {
-      s.push_str(&format!("{:04X} | {} | {}\n", i, pair.get_fst().show(), pair.get_snd().show()));
-    }
-    s.push_str("~~~~ | ~~~~~~~~~~~~ | ~~~~~~~~~~~~\n");
-    for (i, pair) in self.lo.iter().enumerate() {
-      s.push_str(&format!("{:04X} | {} | {}\n", i + self.hi.len(), pair.get_fst().show(), pair.get_snd().show()));
-    }
-    s.push_str("==== | ============ | ============\n");
-    return s;
   }
 }
 

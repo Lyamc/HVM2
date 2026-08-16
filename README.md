@@ -58,7 +58,7 @@ cargo install --git https://github.com/Lyamc/HVM2 --locked
 
 Keep `PATH` short before calling `vcvars64` if you see `The input line is too long`.
 
-`build.rs` passes `/std:c11 /experimental:c11atomics` to `cl`. The C runtime heap-allocates the interaction-net buffers and typically needs **several gigabytes of RAM** (about 6 GiB plus ~128 MiB per compiled worker slot). Worker count is `min(physical cores, 16)` at compile time (`HVM_TPC_L2` overrides the log2). At run time, `hvm run-c --threads N` or `HVM_THREADS` can use fewer workers than that compile-time TPC.
+`build.rs` passes `/std:c11 /experimental:c11atomics` to `cl`. The C runtime heap-allocates the interaction-net buffers and typically needs **several gigabytes of RAM** (about 6 GiB plus ~128 MiB per compiled worker slot). Compile-time C TPC is `2^floor(log2(physical cores))` capped at 16 (`HVM_TPC_L2` overrides the log2). `hvm run` and `gen-rs` default to `min(8, that)` (`--threads N` / `HVM_THREADS` can go up to 16). Heap stripes are always `LEN/16`. The Rust allocator never reuses `ROOT` (var `0x1FFFFFFE`) or the last var slot.
 
 The CUDA runtime is compiled when `nvcc` is on `PATH` or under `CUDA_PATH`. Host code is C++17. Shared-memory `LNet` is 48 KiB so Ampere sm_86 (RTX 3060 class, 99 KiB/block) can launch; Ada 40-series still runs via sm_86 PTX. Rebuild after installing CUDA:
 
@@ -72,6 +72,12 @@ Standalone C from `hvm gen-c file.hvm > file.c`:
 
 ```bat
 cl /nologo /O2 /Gy /std:c11 /experimental:c11atomics file.c /Fe:file.exe
+```
+
+Standalone Rust from `hvm gen-rs file.hvm > file.rs` (no extra crates; same `.hvm` books as `run`):
+
+```bat
+rustc --edition 2021 -C opt-level=3 file.rs -o file.exe
 ```
 
 #### GNU / MinGW
@@ -92,12 +98,16 @@ gcc -O3 -std=c11 -ffunction-sections -fdata-sections file.c -o file.exe -Wl,--gc
 There are multiple ways to run an HVM program:
 
 ```sh
-hvm run    <file.hvm>              # interpret via Rust (parallel; --threads 1 for sequential)
-hvm run-c  <file.hvm>              # interpret via C (parallel; --threads N / HVM_THREADS)
-hvm run-cu <file.hvm>              # interpret via CUDA
-hvm gen-c  <file.hvm>              # compile to standalone C
-hvm gen-cu <file.hvm>              # compile to standalone CUDA
+hvm run     <file.hvm>             # interpret via Rust (parallel; same default TPC as gen-c)
+hvm run-c   <file.hvm>             # interpret via C (parallel; --threads N / HVM_THREADS)
+hvm run-cu  <file.hvm>             # interpret via CUDA
+hvm run-wgpu <file.hvm>            # interpret via WebGPU (optional `--features wgpu`)
+hvm gen-c   <file.hvm>             # compile to standalone C
+hvm gen-cu  <file.hvm>             # compile to standalone CUDA
+hvm gen-rs  <file.hvm>             # compile to standalone Rust (compiled interact)
 ```
+
+`run-wgpu` is **not** auto-detected (`cargo build --release --features wgpu`). It evaluates the same `.hvm` books as `run` / `run-c` / `run-cu` — existing HVM and Bend programs do not need to change. Default heap is 2^24 nodes (`HVM_WGPU_HEAP`, capped by the adapter) and **4096** steal-bag workers (`HVM_WGPU_THREADS`, multiple of 64). CUDA uses 16384 threads plus a ~96 KiB shared `LNet` that WebGPU cannot host. `HVM_WGPU_DEBUG=1` prints adapter limits.
 
 All modes produce the same output. The compiled modes require you to compile the
 generated file (with `gcc file.c -o file` or the `cl` line above), but are faster to run.
