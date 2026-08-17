@@ -65,8 +65,13 @@ fn main() {
   println!("cargo:rerun-if-env-changed=CUDA_HOME");
 
   // Export dynamic symbols so IO plugins can resolve host functions.
+  // Pass a linker flag, not gcc's -rdynamic: rustc on Linux now links with
+  // rust-lld, which rejects -rdynamic (that is a compiler-driver option).
   if target_family == "unix" {
-    println!("cargo:rustc-link-arg=-rdynamic");
+    println!("cargo:rustc-link-arg=--export-dynamic");
+    println!("cargo:rustc-link-lib=dylib=dl");
+    println!("cargo:rustc-link-lib=dylib=pthread");
+    println!("cargo:rustc-link-lib=dylib=m");
   } else if is_windows_gnu {
     println!("cargo:rustc-link-arg=-Wl,--export-all-symbols");
   }
