@@ -50,9 +50,13 @@ fn main() {
 
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
   let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-  let target_family = env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
   let is_windows = target_os == "windows";
   let is_windows_gnu = is_windows && (target_env == "gnu" || target_env == "gnullvm");
+  println!("cargo:rerun-if-env-changed=HVM_HEAP_L2");
+  println!("cargo:rerun-if-env-changed=HVM_RLEN_L2");
+  let heap_l2 = env::var("HVM_HEAP_L2").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(29).clamp(16, 29);
+  let rlen_l2 = env::var("HVM_RLEN_L2").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(24).clamp(16, 24);
+  println!("cargo:warning=C runtime heap 2^{heap_l2} nodes, RLEN 2^{rlen_l2}");
 
   println!("cargo:rerun-if-changed=src/run.c");
   println!("cargo:rerun-if-changed=src/hvm.c");
@@ -80,6 +84,8 @@ fn main() {
       .opt_level(3)
       .warnings(false)
       .define("TPC_L2", &*tpcl2.to_string())
+      .define("G_NODE_LEN_L2", &*heap_l2.to_string())
+      .define("RLEN_L2", &*rlen_l2.to_string())
       .define("IO", None)
       .include("src");
 

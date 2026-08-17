@@ -77,9 +77,9 @@ fn main() {{
   {names}
   let threads = default_threads();
   let net = if threads > 1 {{
-    GNet::with_workers(1 << 29, 1 << 29, threads)
+    GNet::with_workers(heap_len(), heap_len(), threads)
   }} else {{
-    GNet::new(1 << 29, 1 << 29)
+    GNet::new(heap_len(), heap_len())
   }};
   let main_id = book.defs.iter().position(|def| def.name == "main").expect("missing @main");
   let boot = Pair::new(Port::new(REF, main_id as u32), ROOT);

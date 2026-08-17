@@ -153,9 +153,15 @@ static const f32 I24_MIN = (f32) (i32) ((-1u) << 23);
 
 // Global Net
 #define HLEN (1ul << 16) // max 16k high-priority redexes
-#define RLEN (1ul << 24) // max 16m low-priority redexes
-#define G_NODE_LEN (1ul << 29) // max 536m nodes
-#define G_VARS_LEN (1ul << 29) // max 536m vars
+#ifndef RLEN_L2
+#define RLEN_L2 24 // max 16m low-priority redexes
+#endif
+#define RLEN (1ul << RLEN_L2)
+#ifndef G_NODE_LEN_L2
+#define G_NODE_LEN_L2 29 // max 536m nodes
+#endif
+#define G_NODE_LEN (1ul << G_NODE_LEN_L2)
+#define G_VARS_LEN (1ul << G_NODE_LEN_L2)
 // size_t: MSVC unsigned long is 32-bit and TPC*RLEN can exceed 2^32-1.
 #define G_RBAG_LEN ((size_t)TPC * (size_t)RLEN)
 

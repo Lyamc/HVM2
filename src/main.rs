@@ -208,10 +208,11 @@ fn main() {
 
 pub fn run(book: &hvm::Book, threads: u32) {
   // Initializes the global net
+  let heap = hvm::heap_len();
   let net = if threads > 1 {
-    hvm::GNet::with_workers(1 << 29, 1 << 29, threads)
+    hvm::GNet::with_workers(heap, heap, threads)
   } else {
-    hvm::GNet::new(1 << 29, 1 << 29)
+    hvm::GNet::new(heap, heap)
   };
 
   // Creates an initial redex that calls main

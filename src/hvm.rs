@@ -89,6 +89,14 @@ pub const HLEN: usize = 1 << 16;
 /// Low-priority steal-bag slots per worker (C uses `1<<24`; that bag is mostly idle).
 pub const RLEN: usize = 1 << 20;
 
+/// Node/var buffer length. Default `1<<29` (~6 GiB). CI sets `HVM_HEAP_L2=24`.
+pub fn heap_len() -> usize {
+  match std::env::var("HVM_HEAP_L2") {
+    Ok(s) => s.parse::<u32>().ok().map(|n| 1usize << n.clamp(16, 29)).unwrap_or(1 << 29),
+    Err(_) => 1 << 29,
+  }
+}
+
 /// `2^floor(log2(physical))` capped at `MAX_TPC` — same rule as `hvm gen-c`.
 pub fn tpc_from_physical(physical: usize) -> u32 {
   let cores = physical.max(1) as u32;
