@@ -1,7 +1,3 @@
-# rust-lld (default Linux rustc linker) rejects gcc's -rdynamic.
-# This is the rustc-native equivalent so IO plugins can see host symbols.
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "export-executable-symbols"]
-
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "export-executable-symbols"]
+# Intentionally empty: rustc-lld rejects gcc -rdynamic, and rustc-link-arg
+# --export-dynamic broke `cargo test --release` on ubuntu-latest. IO plugins
+# still resolve via -ldl; host-symbol export can be restored later if needed.
