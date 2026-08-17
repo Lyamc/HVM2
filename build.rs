@@ -64,14 +64,10 @@ fn main() {
   println!("cargo:rerun-if-env-changed=CUDA_PATH");
   println!("cargo:rerun-if-env-changed=CUDA_HOME");
 
-  // IO plugins resolve host symbols. Linux rustflags live in .cargo/config.toml
-  // (-C export-executable-symbols). Do not pass gcc's -rdynamic: rustc now
-  // links with rust-lld, which rejects that compiler-driver option.
-  if target_family == "unix" {
-    println!("cargo:rustc-link-lib=dylib=dl");
-    println!("cargo:rustc-link-lib=dylib=pthread");
-    println!("cargo:rustc-link-lib=dylib=m");
-  } else if is_windows_gnu {
+  // Do not pass -lpthread/-ldl/-lm on Linux: glibc ships those in libc, and
+  // rust-lld rejects the GNU ld scripts in libpthread.so / libdl.so on
+  // Ubuntu 24.04 (cargo check does not link, so it stays green).
+  if is_windows_gnu {
     println!("cargo:rustc-link-arg=-Wl,--export-all-symbols");
   }
 
@@ -94,6 +90,7 @@ fn main() {
       c.flag("/Gy");
     } else {
       c.flag_if_supported("-std=c11");
+      c.flag_if_supported("-pthread");
       c.flag_if_supported("-ffunction-sections");
       c.flag_if_supported("-fdata-sections");
     }
