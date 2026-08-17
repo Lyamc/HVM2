@@ -37,10 +37,17 @@ jobs:
           key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
       # Skip the huge examples (bitonic/stress) on the 7 GiB Ubuntu runner.
       # Windows already skips them. LTO is off so the test binary links in-budget.
-      - run: cargo test --release -- --skip test_run_examples
+      - name: Build tests
+        run: cargo test --release --no-run
         env:
           CARGO_PROFILE_RELEASE_LTO: "false"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      - name: Run tests
+        run: cargo test --release -- --skip test_run_examples --test-threads=1 --nocapture
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          RUST_BACKTRACE: "1"
   test-cuda:
     # Upstream uses a HigherOrderCO self-hosted CUDA box. This fork does not.
     if: false
