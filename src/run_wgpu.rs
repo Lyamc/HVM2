@@ -36,6 +36,8 @@ const M_VROVER: usize = 10;
 const M_OFLOW: usize = 11;
 const M_OFLOW_BASE: usize = 12;
 const M_OFLOW_CAP: usize = 13;
+const M_NFREE: usize = 14;
+const M_VFREE: usize = 15;
 const META_WORDS: usize = 16;
 
 const W_NPUT: usize = 0;
@@ -49,15 +51,15 @@ const W_STRIDE: usize = 8;
 const MAX_DEF_SLOTS: usize = 1024;
 const DEFAULT_HEAP: u32 = 1 << 23; // 8M nodes (~64 MiB pairs); smaller working set than 32M
 const WG: u32 = 64;
-const DEFAULT_NTHREADS: u32 = 8; // sieve keeps a few live redexes; HVM_WGPU_THREADS=1 drops node atomics
+const DEFAULT_NTHREADS: u32 = 8; // sieve ITRS matched 64 lanes; extra stealers only add WDDM heat
 const DEFAULT_RSPAN: u32 = 1024;
 const DEFAULT_OVERFLOW: u32 = 1 << 22;
 const MAX_TURNS: u32 = 1 << 20;
-const STEPS_PER_DISPATCH: u32 = 4096; // 32768 TDRs on a fragmented resume heap
+const STEPS_PER_DISPATCH: u32 = 8192; // free-list alloc; adaptive host grows this toward the TDR budget
 /// This adapter/driver dies after ~256 compute dispatches on one device.
 const KERNELS_PER_SUBMIT: u32 = 1;
-const RECYCLE_AFTER_KERNELS: u32 = 40;
-const CHECK_EVERY: u32 = 16;
+const RECYCLE_AFTER_KERNELS: u32 = 16; // 40-kernel workers died ~turn 22 on a resume heap
+const CHECK_EVERY: u32 = 2;
 const MAX_WORKER_RETRIES: u32 = 3;
 
 pub fn run(book: &hvm::Book) {
@@ -154,7 +156,7 @@ fn supervise() -> Result<(), String> {
   let recycle_ms = env::var("HVM_WGPU_RECYCLE_MS")
     .ok()
     .and_then(|s| s.parse().ok())
-    .unwrap_or(8_000u64);
+    .unwrap_or(2_000u64);
   let lost_ms = env::var("HVM_WGPU_COOLDOWN_MS")
     .ok()
     .and_then(|s| s.parse().ok())
@@ -422,7 +424,18 @@ fn maybe_gpu_reset(debug: bool) {
     .status();
 }
 
-fn snap_paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+struct GpuSnap {
+  node: Vec<u32>,
+  vars: Vec<u32>,
+  rbag: Vec<u32>,
+  workers: Vec<u32>,
+  meta: [u32; META_WORDS],
+  nfree: Vec<u32>,
+  vfree: Vec<u32>,
+  itrs: u64,
+}
+
+fn snap_paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
   (
     dir.join("node.bin"),
     dir.join("vars.bin"),
@@ -430,7 +443,71 @@ fn snap_paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathB
     dir.join("work.bin"),
     dir.join("meta.bin"),
     dir.join("itrs.bin"),
+    dir.join("nfree.bin"),
+    dir.join("vfree.bin"),
   )
+}
+
+fn write_snap(dir: &Path, snap: &GpuSnap) -> Result<(), String> {
+  let (np, vp, rp, wp, mp, ip, nfp, vfp) = snap_paths(dir);
+  write_u32s(&np, &snap.node)?;
+  write_u32s(&vp, &snap.vars)?;
+  write_u32s(&rp, &snap.rbag)?;
+  write_u32s(&wp, &snap.workers)?;
+  write_u32s(&mp, &snap.meta)?;
+  write_u32s(&nfp, &snap.nfree)?;
+  write_u32s(&vfp, &snap.vfree)?;
+  std::fs::write(&ip, snap.itrs.to_le_bytes()).map_err(|e| e.to_string())?;
+  Ok(())
+}
+
+fn read_snap(dir: &Path, heap: u32) -> Result<GpuSnap, String> {
+  let (np, vp, rp, wp, mp, ip, nfp, vfp) = snap_paths(dir);
+  let itrs = {
+    let b = std::fs::read(&ip).map_err(|e| e.to_string())?;
+    u64::from_le_bytes(b.try_into().map_err(|_| "itrs.bin")?)
+  };
+  let node = read_snap_u32s(&np)?;
+  let vars = read_snap_u32s(&vp)?;
+  let rbag = read_snap_u32s(&rp)?;
+  let workers = read_snap_u32s(&wp)?;
+  let mut meta = [0u32; META_WORDS];
+  let mv = read_snap_u32s(&mp)?;
+  meta.copy_from_slice(&mv[..META_WORDS.min(mv.len())]);
+  let (nfree, vfree) = if nfp.exists() && vfp.exists() {
+    (read_snap_u32s(&nfp)?, read_snap_u32s(&vfp)?)
+  } else {
+    rebuild_freelists(&node, &vars, heap, &mut meta)
+  };
+  Ok(GpuSnap { node, vars, rbag, workers, meta, nfree, vfree, itrs })
+}
+
+/// Host rebuild: every zero node/var (except 0) goes on the Treiber stack.
+fn rebuild_freelists(
+  node: &[u32],
+  vars: &[u32],
+  heap: u32,
+  meta: &mut [u32; META_WORDS],
+) -> (Vec<u32>, Vec<u32>) {
+  let n = heap as usize;
+  let mut nfree = vec![0u32; n];
+  let mut vfree = vec![0u32; n];
+  let mut nhead = 0u32;
+  let mut vhead = 0u32;
+  let nwords = (n * 2).min(node.len());
+  for i in (1..n).rev() {
+    if i * 2 + 1 < nwords && node[i * 2] == 0 && node[i * 2 + 1] == 0 {
+      nfree[i] = nhead;
+      nhead = i as u32;
+    }
+    if i < vars.len() && vars[i] == 0 {
+      vfree[i] = vhead;
+      vhead = i as u32;
+    }
+  }
+  meta[M_NFREE] = nhead;
+  meta[M_VFREE] = vhead;
+  (nfree, vfree)
 }
 
 fn write_u32s(path: &Path, data: &[u32]) -> Result<(), String> {
@@ -474,7 +551,7 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
     Ok((instance, adapter))
   }
 
-  let (mut instance, mut adapter) = request_adapter()?;
+  let (_instance, adapter) = request_adapter()?;
   let info = adapter.get_info();
   let limits = adapter.limits();
   let heap = heap_len_for(&limits);
@@ -539,70 +616,80 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
   let snap_dir = env::var("HVM_WGPU_SNAP").ok().map(PathBuf::from);
   let resume = snap_dir.as_ref().map(|d| d.join("node.bin").exists()).unwrap_or(false);
 
-  let (mut node_cpu, mut vars_cpu, mut rbag_cpu, mut workers_cpu, mut meta_cpu, mut host_itrs) =
-    if resume {
-      let d = snap_dir.as_ref().unwrap();
-      let (np, vp, rp, wp, mp, ip) = snap_paths(d);
-      let itrs = {
-        let b = std::fs::read(&ip).map_err(|e| e.to_string())?;
-        u64::from_le_bytes(b.try_into().map_err(|_| "itrs.bin")?)
-      };
-      if debug {
-        eprintln!("wgpu resume itrs={itrs} from {}", d.display());
-      }
-      (
-        read_snap_u32s(&np)?,
-        read_snap_u32s(&vp)?,
-        read_snap_u32s(&rp)?,
-        read_snap_u32s(&wp)?,
-        {
-          let v = read_snap_u32s(&mp)?;
-          let mut a = [0u32; META_WORDS];
-          a.copy_from_slice(&v[..META_WORDS.min(v.len())]);
-          a
-        },
-        itrs,
-      )
-    } else {
-      let mut node_cpu = vec![0u32; heap as usize * 2];
-      let mut vars_cpu = vec![0u32; heap as usize];
-      vars_cpu[0] = NONE;
-      let mut rbag_cpu = vec![0u32; rbag_len as usize * 2];
-      rbag_cpu[0] = boot_fst;
-      rbag_cpu[1] = ROOT;
-      let mut workers_cpu = vec![0u32; nthreads as usize * W_STRIDE];
-      let span = (heap / nthreads).max(1);
-      for tid in 0..nthreads as usize {
-        let base = (tid as u32 * span).min(heap.saturating_sub(1));
-        workers_cpu[tid * W_STRIDE + W_NPUT] = base;
-        workers_cpu[tid * W_STRIDE + W_VPUT] = base;
-      }
-      workers_cpu[W_RLEN] = 1;
-      workers_cpu[W_RPUT] = 1;
-      let mut meta_cpu = [0u32; META_WORDS];
-      meta_cpu[M_NLEN] = heap;
-      meta_cpu[M_VLEN] = heap;
-      meta_cpu[M_MAX] = steps;
-      meta_cpu[M_NTHREADS] = nthreads;
-      meta_cpu[M_RSPAN] = rspan;
-      meta_cpu[M_NROVER] = 1;
-      meta_cpu[M_VROVER] = 1;
-      meta_cpu[M_OFLOW] = 0;
-      meta_cpu[M_OFLOW_BASE] = nthreads * rspan;
-      meta_cpu[M_OFLOW_CAP] = overflow;
-      (node_cpu, vars_cpu, rbag_cpu, workers_cpu, meta_cpu, 0u64)
-    };
-  meta_cpu[M_MAX] = steps;
-  meta_cpu[M_NTHREADS] = nthreads;
-  meta_cpu[M_NLEN] = heap;
-  meta_cpu[M_VLEN] = heap;
+  let mut snap = if resume {
+    let d = snap_dir.as_ref().unwrap();
+    let s = read_snap(d, heap)?;
+    if debug {
+      eprintln!("wgpu resume itrs={} from {}", s.itrs, d.display());
+    }
+    s
+  } else {
+    let node = vec![0u32; heap as usize * 2];
+    let mut vars = vec![0u32; heap as usize];
+    vars[0] = NONE;
+    let mut rbag = vec![0u32; rbag_len as usize * 2];
+    rbag[0] = boot_fst;
+    rbag[1] = ROOT;
+    let mut workers = vec![0u32; nthreads as usize * W_STRIDE];
+    let span = (heap / nthreads).max(1);
+    for tid in 0..nthreads as usize {
+      let base = (tid as u32 * span).min(heap.saturating_sub(1));
+      workers[tid * W_STRIDE + W_NPUT] = base;
+      workers[tid * W_STRIDE + W_VPUT] = base;
+    }
+    workers[W_RLEN] = 1;
+    workers[W_RPUT] = 1;
+    let mut meta = [0u32; META_WORDS];
+    meta[M_NLEN] = heap;
+    meta[M_VLEN] = heap;
+    meta[M_MAX] = steps;
+    meta[M_NTHREADS] = nthreads;
+    meta[M_RSPAN] = rspan;
+    meta[M_NROVER] = 1;
+    meta[M_VROVER] = 1;
+    meta[M_OFLOW] = 0;
+    meta[M_OFLOW_BASE] = nthreads * rspan;
+    meta[M_OFLOW_CAP] = overflow;
+    meta[M_NFREE] = 0;
+    meta[M_VFREE] = 0;
+    GpuSnap {
+      node,
+      vars,
+      rbag,
+      workers,
+      meta,
+      nfree: vec![0u32; heap as usize],
+      vfree: vec![0u32; heap as usize],
+      itrs: 0,
+    }
+  };
+  snap.meta[M_NTHREADS] = nthreads;
+  snap.meta[M_NLEN] = heap;
+  snap.meta[M_VLEN] = heap;
+  if snap.nfree.len() != heap as usize {
+    snap.nfree.resize(heap as usize, 0);
+  }
+  if snap.vfree.len() != heap as usize {
+    snap.vfree.resize(heap as usize, 0);
+  }
 
   let start = std::time::Instant::now();
   let mut turns = 0u32;
   let mut prev_itrs = u32::MAX;
   let mut stall = 0u32;
-  let mut nodes_out: Vec<u32>;
-  let mut vars_out: Vec<u32>;
+  let nodes_out: Vec<u32>;
+  let vars_out: Vec<u32>;
+  let steps_fixed = env::var("HVM_WGPU_STEPS").is_ok();
+  let mut cur_steps = if steps_fixed {
+    steps
+  } else if resume && snap.meta[M_MAX] > 0 {
+    // Keep a shrink from the previous worker. `.max(steps)` used to undo it
+    // and the next resume kernel TDRed at the old fat width.
+    snap.meta[M_MAX]
+  } else {
+    steps
+  };
+  snap.meta[M_MAX] = cur_steps;
 
   'sessions: loop {
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -618,12 +705,14 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
       eprintln!("run-wgpu wgpu: {err}");
     }));
 
-    let node_buf = storage_init(&device, bytemuck::cast_slice(&node_cpu));
-    let vars_buf = storage_init(&device, bytemuck::cast_slice(&vars_cpu));
-    let rbag_buf = storage_init(&device, bytemuck::cast_slice(&rbag_cpu));
+    let node_buf = storage_init(&device, bytemuck::cast_slice(&snap.node));
+    let vars_buf = storage_init(&device, bytemuck::cast_slice(&snap.vars));
+    let rbag_buf = storage_init(&device, bytemuck::cast_slice(&snap.rbag));
     let book_buf = storage_init(&device, bytemuck::cast_slice(&packed));
-    let meta_buf = storage_init(&device, bytemuck::cast_slice(&meta_cpu));
-    let worker_buf = storage_init(&device, bytemuck::cast_slice(&workers_cpu));
+    let meta_buf = storage_init(&device, bytemuck::cast_slice(&snap.meta));
+    let worker_buf = storage_init(&device, bytemuck::cast_slice(&snap.workers));
+    let nfree_buf = storage_init(&device, bytemuck::cast_slice(&snap.nfree));
+    let vfree_buf = storage_init(&device, bytemuck::cast_slice(&snap.vfree));
 
     let shader_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -655,6 +744,8 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
         bind_entry(3, &book_buf),
         bind_entry(4, &meta_buf),
         bind_entry(5, &worker_buf),
+        bind_entry(6, &nfree_buf),
+        bind_entry(7, &vfree_buf),
       ],
     });
     let groups = nthreads.div_ceil(WG);
@@ -677,8 +768,9 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
 
     let mut kernels = 0u32;
     let mut last_m = [0u32; META_WORDS];
-    last_m.copy_from_slice(&meta_cpu);
+    last_m.copy_from_slice(&snap.meta);
     loop {
+      let t0 = std::time::Instant::now();
       let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("hvm-dispatch"),
       });
@@ -701,17 +793,19 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
         Ok(Err(e)) => return Err(format!("poll: {e}")),
         Err(_) => {
           eprintln!(
-            "wgpu device-lost after {turns} turns / {host_itrs} itrs (exit 101 for supervisor retry)"
+            "wgpu device-lost after {turns} turns / {} itrs (exit 101 for supervisor retry)",
+            snap.itrs
           );
           std::process::exit(101);
         }
       }
+      let kernel_ms = t0.elapsed().as_millis();
 
       turns += 1;
-      let check = kernels >= RECYCLE_AFTER_KERNELS || kernels % CHECK_EVERY == 0;
+      let check = kernels >= RECYCLE_AFTER_KERNELS || kernels % CHECK_EVERY == 0 || kernel_ms > 1400;
       if !check {
         if turns >= MAX_TURNS {
-          return Err(format!("turn cap ({MAX_TURNS}) itrs={host_itrs}"));
+          return Err(format!("turn cap ({MAX_TURNS}) itrs={}", snap.itrs));
         }
         continue;
       }
@@ -733,7 +827,7 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
       if m[M_OOM] != 0 {
         return Err(format!(
           "OOM after {} itrs (heap={heap}, threads={nthreads}, rspan={rspan}). Set HVM_WGPU_HEAP larger.",
-          host_itrs + m[M_ITRS] as u64
+          snap.itrs + m[M_ITRS] as u64
         ));
       }
       let mut remaining = m[M_OFLOW];
@@ -742,7 +836,7 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
       }
       let itrs_now = m[M_ITRS];
       if remaining == 0 {
-        host_itrs += itrs_now as u64;
+        snap.itrs += itrs_now as u64;
         vars_out = read_u32s(&device, &queue, &vars_buf, heap as usize);
         nodes_out = read_u32s(&device, &queue, &node_buf, heap as usize * 2);
         break 'sessions;
@@ -752,44 +846,58 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
         if stall >= 8 {
           return Err(format!(
             "stalled at {} itrs with remain={remaining} (heap={heap}, threads={nthreads})",
-            host_itrs + itrs_now as u64
+            snap.itrs + itrs_now as u64
           ));
         }
       } else {
         stall = 0;
       }
       prev_itrs = itrs_now;
+      if !steps_fixed {
+        let next = if itrs_now > 0 && kernel_ms < 600 && cur_steps < (1 << 18) {
+          cur_steps.saturating_mul(2).min(1 << 18)
+        } else if kernel_ms > 1600 && cur_steps > 256 {
+          (cur_steps / 2).max(256)
+        } else {
+          cur_steps
+        };
+        if next != cur_steps {
+          cur_steps = next;
+          snap.meta[M_MAX] = cur_steps;
+          queue.write_buffer(&meta_buf, (M_MAX * 4) as u64, bytemuck::bytes_of(&cur_steps));
+          if debug {
+            eprintln!("wgpu adapt steps={cur_steps} kernel={kernel_ms}ms");
+          }
+        }
+      }
       if debug {
         eprintln!(
-          "wgpu turn={turns} itrs={} remain={remaining}",
-          host_itrs + itrs_now as u64
+          "wgpu turn={turns} itrs={} remain={remaining} steps={cur_steps} kernel={kernel_ms}ms",
+          snap.itrs + itrs_now as u64
         );
       }
       if turns >= MAX_TURNS {
         return Err(format!(
           "turn cap ({MAX_TURNS}) with remain={remaining} itrs={}",
-          host_itrs + itrs_now as u64
+          snap.itrs + itrs_now as u64
         ));
       }
-      if kernels >= RECYCLE_AFTER_KERNELS {
-        host_itrs += itrs_now as u64;
-        node_cpu = read_u32s(&device, &queue, &node_buf, heap as usize * 2);
-        vars_cpu = read_u32s(&device, &queue, &vars_buf, heap as usize);
-        rbag_cpu = read_u32s(&device, &queue, &rbag_buf, rbag_len as usize * 2);
-        workers_cpu = w;
-        meta_cpu = last_m;
-        meta_cpu[M_ITRS] = 0;
-        meta_cpu[M_RLEN] = remaining;
+      if kernels >= RECYCLE_AFTER_KERNELS || (kernels >= 8 && kernel_ms > 1400) {
+        snap.itrs += itrs_now as u64;
+        snap.node = read_u32s(&device, &queue, &node_buf, heap as usize * 2);
+        snap.vars = read_u32s(&device, &queue, &vars_buf, heap as usize);
+        snap.rbag = read_u32s(&device, &queue, &rbag_buf, rbag_len as usize * 2);
+        snap.nfree = read_u32s(&device, &queue, &nfree_buf, heap as usize);
+        snap.vfree = read_u32s(&device, &queue, &vfree_buf, heap as usize);
+        snap.workers = w;
+        snap.meta = last_m;
+        snap.meta[M_ITRS] = 0;
+        snap.meta[M_RLEN] = remaining;
+        snap.meta[M_MAX] = cur_steps;
         if let Some(d) = snap_dir.as_ref() {
-          let (np, vp, rp, wp, mp, ip) = snap_paths(d);
-          write_u32s(&np, &node_cpu)?;
-          write_u32s(&vp, &vars_cpu)?;
-          write_u32s(&rp, &rbag_cpu)?;
-          write_u32s(&wp, &workers_cpu)?;
-          write_u32s(&mp, &meta_cpu)?;
-          std::fs::write(&ip, host_itrs.to_le_bytes()).map_err(|e| e.to_string())?;
+          write_snap(d, &snap)?;
           if debug {
-            eprintln!("wgpu worker recycle itrs={host_itrs}");
+            eprintln!("wgpu worker recycle itrs={}", snap.itrs);
           }
           return Ok(false);
         }
@@ -798,7 +906,7 @@ fn run_inner(book: &hvm::Book) -> Result<bool, String> {
     }
   }
   let duration = start.elapsed();
-  let itrs = host_itrs;
+  let itrs = snap.itrs;
   let vars = vars_out;
   let nodes = nodes_out;
 

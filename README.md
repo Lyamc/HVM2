@@ -109,15 +109,16 @@ hvm gen-rs  <file.hvm>             # compile to standalone Rust (compiled intera
 
 `run-wgpu` is **not** auto-detected (`cargo build --release --features wgpu`). It evaluates the same `.hvm` books as `run` / `run-c` / `run-cu` — existing HVM and Bend programs do not need to change. `ROOT` (`0xFFFFFFF8`) is remapped to `vars[0]` only inside this backend.
 
-Defaults (override with env): heap **2^23** nodes (`HVM_WGPU_HEAP`), **8** lanes (`HVM_WGPU_THREADS`; `1` uses a non-atomic node/var shader), **4096** steps/dispatch (`HVM_WGPU_STEPS`), rspan **1024** (`HVM_WGPU_RSPAN`). Needs `SHADER_INT64_ATOMIC_ALL_OPS` (Vulkan on this NVIDIA adapter; DX12 does not have it).
+Defaults (override with env): heap **2^23** nodes (`HVM_WGPU_HEAP`), **8** lanes (`HVM_WGPU_THREADS`; `1` uses a non-atomic node/var shader), **8192** steps/dispatch (`HVM_WGPU_STEPS` pins this; otherwise the host doubles/halves toward a ~0.6–1.6 s kernel and **keeps a shrink across resume**), rspan **1024** (`HVM_WGPU_RSPAN`). Needs `SHADER_INT64_ATOMIC_ALL_OPS` (Vulkan on this NVIDIA adapter; DX12 does not have it). Workers recycle every **16** kernels (or sooner if a kernel exceeds 1.4 s).
+
+Freed nodes/vars go on a Treiber stack (`nfree`/`vfree`). Alloc pops that stack instead of scanning 4096 CAS slots — that scan was what TDRed on a fragmented resume heap.
 
 Windows/WDDM notes (resume here):
-- Hello/fib finish. Sieve/sort do not, at ~0.2 MIPS vs `run-cu` ~21 MIPS.
-- **32768**-step kernels TDR on a fragmented resume heap. **4096** can continue past the old 12.76M ITRS wall (measured to ~13.8M).
-- Process snapshot/resume works (`%TEMP%\hvm-wgpu-*` or `HVM_WGPU_SNAP`). From-zero epochs of 3×40 kernels each reach ~11.16M repeatedly. Resume of that snap with fat kernels dies at turn 16.
+- Hello/fib finish. Sieve/sort still need a long run; target is the `run-cu` band (~21 MIPS sieve / ~7 s sort).
+- Process snapshot/resume works (`%TEMP%\hvm-wgpu-*` or `HVM_WGPU_SNAP`), including `nfree.bin` / `vfree.bin`.
 - `timeout /t` is unusable when stdin is piped; inter-epoch waits use `thread::sleep` / `ping`.
 - Device-lost must exit **101** (not 11) so the outer loop backs off 30s+ instead of retrying every 2s.
-- `HVM_WGPU_DEBUG=1` prints adapter limits and turn/ITRS. `HVM_WGPU_GPU_RESET=1` runs `nvidia-smi --gpu-reset` (kills other GPU clients; did not by itself clear the dispatch budget).
+- `HVM_WGPU_DEBUG=1` prints adapter limits, turn/ITRS, and step adaptation. `HVM_WGPU_GPU_RESET=1` runs `nvidia-smi --gpu-reset`.
 
 CUDA uses 16384 threads plus a shared `LNet` that WebGPU cannot host.
 

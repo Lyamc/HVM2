@@ -7,6 +7,8 @@
 @group(0) @binding(3) var<storage, read> book: array<u32>;
 @group(0) @binding(4) var<storage, read_write> ctl: array<atomic<u32>>;
 @group(0) @binding(5) var<storage, read_write> worker: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> nfree: array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read_write> vfree: array<atomic<u32>>;
 
 const VAR: u32 = 0u;
 const REF: u32 = 1u;
@@ -71,6 +73,8 @@ const M_VROVER: u32 = 10u;
 const M_OFLOW: u32 = 11u;
 const M_OFLOW_BASE: u32 = 12u;
 const M_OFLOW_CAP: u32 = 13u;
+const M_NFREE: u32 = 14u;
+const M_VFREE: u32 = 15u;
 
 const W_NPUT: u32 = 0u;
 const W_VPUT: u32 = 1u;
@@ -160,8 +164,61 @@ fn node_store(i: u32, p: vec2<u32>) {
   nst(i, pack2(p.x, p.y));
 }
 
+fn nfree_push(i: u32) {
+  if i == 0u { return; }
+  for (var t = 0u; t < 32u; t++) {
+    let h = atomicLoad(&ctl[M_NFREE]);
+    atomicStore(&nfree[i], h);
+    if atomicCompareExchangeWeak(&ctl[M_NFREE], h, i).exchanged {
+      return;
+    }
+  }
+}
+
 fn node_take(i: u32) -> vec2<u32> {
-  return unpack2(nxchg(i, u64(0)));
+  let p = unpack2(nxchg(i, u64(0)));
+  nfree_push(i);
+  return p;
+}
+
+fn nfree_pop() -> u32 {
+  for (var t = 0u; t < 32u; t++) {
+    let h = atomicLoad(&ctl[M_NFREE]);
+    if h == 0u { return 0u; }
+    let nxt = atomicLoad(&nfree[h]);
+    if atomicCompareExchangeWeak(&ctl[M_NFREE], h, nxt).exchanged {
+      return h;
+    }
+  }
+  return 0u;
+}
+
+fn vfree_push(i: u32) {
+  if i == 0u { return; }
+  for (var t = 0u; t < 32u; t++) {
+    let h = atomicLoad(&ctl[M_VFREE]);
+    atomicStore(&vfree[i], h);
+    if atomicCompareExchangeWeak(&ctl[M_VFREE], h, i).exchanged {
+      return;
+    }
+  }
+}
+
+fn vfree_pop() -> u32 {
+  for (var t = 0u; t < 32u; t++) {
+    let h = atomicLoad(&ctl[M_VFREE]);
+    if h == 0u { return 0u; }
+    let nxt = atomicLoad(&vfree[h]);
+    if atomicCompareExchangeWeak(&ctl[M_VFREE], h, nxt).exchanged {
+      return h;
+    }
+  }
+  return 0u;
+}
+
+fn var_release(idx: u32) {
+  vst(idx, 0u);
+  vfree_push(idx);
 }
 
 fn wf(tid: u32, field: u32) -> u32 {
@@ -309,7 +366,7 @@ fn enter(start: u32) -> u32 {
     if val == NONE || val == 0u {
       return p;
     }
-    vst(idx, 0u);
+    var_release(idx);
     p = val;
   }
   return p;
@@ -336,7 +393,7 @@ fn link(aa: u32, bb: u32) {
     if a_ == NONE {
       return;
     }
-    vst(idx, 0u);
+    var_release(idx);
     a = a_;
   }
 }
@@ -358,49 +415,78 @@ fn part_range(len: u32) -> vec2<u32> {
 fn node_alloc(num: u32) -> bool {
   if num == 0u { return true; }
   if num > MAX_SLOTS { return false; }
-  let nlen = g_nlen;
-  let rg = part_range(nlen);
-  let base = max(rg.x, 1u);
-  let end = max(rg.y, base + 1u);
-  let limit = min(max(end - base, 1u) * 2u, 4096u);
   var got = 0u;
-  for (var k = 0u; k < limit; k++) {
-    nput = nput + 1u;
-    if nput >= end || nput == 0u {
-      nput = base;
-      nwrap = 1u;
-    }
-    // Always CAS: rover used to steal other stripes and first-pass stores tore REFs.
-    if !ncas0(nput) { continue; }
-    nloc[got] = nput;
+  // Recycled slots first — O(1) even on a fragmented resume heap.
+  while got < num {
+    let i = nfree_pop();
+    if i == 0u { break; }
+    if i >= g_nlen { continue; }
+    if !ncas0(i) { continue; }
+    nloc[got] = i;
     got = got + 1u;
-    if got >= num { return true; }
   }
-  return false;
+  if got < num {
+    let rg = part_range(g_nlen);
+    let base = max(rg.x, 1u);
+    let end = max(rg.y, base + 1u);
+    // Short bump only. The old 4096-CAS scan is what TDRs after wrap.
+    for (var k = 0u; k < 64u && got < num; k++) {
+      nput = nput + 1u;
+      if nput >= end || nput == 0u {
+        nput = base;
+        nwrap = 1u;
+      }
+      if !ncas0(nput) { continue; }
+      nloc[got] = nput;
+      got = got + 1u;
+    }
+  }
+  if got < num {
+    for (var j = 0u; j < got; j++) {
+      nst(nloc[j], u64(0));
+      nfree_push(nloc[j]);
+    }
+    return false;
+  }
+  return true;
 }
 
 fn vars_alloc(num: u32) -> bool {
   if num == 0u { return true; }
   if num > MAX_SLOTS { return false; }
-  let vlen = g_vlen;
-  let rg = part_range(vlen);
-  let base = max(rg.x, 1u);
-  let end = max(rg.y, base + 1u);
-  let limit = min(max(end - base, 1u) * 2u, 4096u);
   var got = 0u;
-  for (var k = 0u; k < limit; k++) {
-    vput = vput + 1u;
-    if vput >= vlen || vput == 0u || vput >= end {
-      vput = base;
-      vwrap = 1u;
-    }
-    if vput == 0u { continue; }
-    if !vcas(vput, 0u, NONE) { continue; }
-    vloc[got] = vput;
+  while got < num {
+    let i = vfree_pop();
+    if i == 0u { break; }
+    if i >= g_vlen { continue; }
+    if !vcas(i, 0u, NONE) { continue; }
+    vloc[got] = i;
     got = got + 1u;
-    if got >= num { return true; }
   }
-  return false;
+  if got < num {
+    let rg = part_range(g_vlen);
+    let base = max(rg.x, 1u);
+    let end = max(rg.y, base + 1u);
+    for (var k = 0u; k < 64u && got < num; k++) {
+      vput = vput + 1u;
+      if vput >= g_vlen || vput == 0u || vput >= end {
+        vput = base;
+        vwrap = 1u;
+      }
+      if vput == 0u { continue; }
+      if !vcas(vput, 0u, NONE) { continue; }
+      vloc[got] = vput;
+      got = got + 1u;
+    }
+  }
+  if got < num {
+    for (var j = 0u; j < got; j++) {
+      vst(vloc[j], 0u);
+      vfree_push(vloc[j]);
+    }
+    return false;
+  }
+  return true;
 }
 
 fn get_resources(need_node: u32, need_vars: u32) -> bool {
